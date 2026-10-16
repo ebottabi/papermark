@@ -1,0 +1,28 @@
+# Papermark agent API server (systemd unit)
+# Install to /etc/systemd/system/papermark.service
+[Unit]
+Description=Papermark agent API server
+After=network-online.target postgresql.service redis-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=papermark
+Group=papermark
+WorkingDirectory=/opt/papermark
+EnvironmentFile=/etc/papermark/papermark.env
+ExecStart=/opt/papermark/bin/server
+Restart=on-failure
+RestartSec=5
+# shell_exec children share the unit's cgroup; stop kills them too.
+KillMode=control-group
+
+# --- hardening ---
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

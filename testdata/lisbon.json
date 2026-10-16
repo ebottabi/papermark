@@ -1,0 +1,22 @@
+[
+  [
+    { "text": "I'll plan the trip first." },
+    { "tool": "file_write", "input": { "path": "todo.md", "content": "- [ ] Research a Lisbon weekend\n- [ ] Pick a date\n- [ ] Write options.md\n" } }
+  ],
+  [
+    { "web_search": "Lisbon weekend itinerary", "results": [
+      { "title": "48 hours in Lisbon", "url": "https://example.com/lisbon-48h" },
+      { "title": "Lisbon neighborhoods guide", "url": "https://example.com/lisbon-neighborhoods" }
+    ] },
+    { "tool": "message_notify_user", "input": { "text": "Found good options in Alfama, Baixa and Belém." } }
+  ],
+  [
+    { "tool": "message_ask_user", "input": { "text": "Which date?" } }
+  ],
+  [
+    { "tool": "shell_exec", "input": { "command": "printf '# Lisbon options\\n\\n1. Alfama walk and fado\\n2. Belém tower and pastéis\\n3. Sintra day trip\\n' > options.md && wc -l options.md" } }
+  ],
+  [
+    { "tool": "idle", "input": { "result": "Your Lisbon weekend options are in options.md.", "files": ["options.md"] } }
+  ]
+]

@@ -1,0 +1,7 @@
+data/
+.DS_Store
+bin/
+.env
+coverage.out
+coverage.html
+node_modules/
