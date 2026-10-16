@@ -6,6 +6,74 @@ Status: proposal only, no code written. Paths are relative to /Users/ebot/paperm
 
 Keep the current loop. It is already durable, single-process-per-run and does not use a master/worker split. Swap its model client (Anthropic SDK) for a Fireworks `/chat/completions` streaming client **copied from plane** (`plane:runtime/chat.go` and friends, about 450 lines after trimming). Store messages in OpenAI shape instead of Anthropic shape. Turn `web_search`/`web_fetch` into ordinary tools. Move push (and later email) to job kinds on the existing queue. Delete the Anthropic client, the SDK dependency and the Anthropic fake. No new tables, no orchestrator, no sub-agents. The AgentEvent stream in API.md is unchanged.
 
+### How it works
+
+The whole system. One queue, any worker takes any job, no master.
+
+```
+ Keen iOS app
+   │  POST /v1/tasks, /reply, /confirm, /stop        ▲ SSE: event: delta / AgentEvent
+   ▼                                                 │
+┌──────────────────────── cmd/server ───────────────┴──────────────┐
+│ Fiber API ── insert task + enqueue job (one tx) ──► Notify()     │
+│     ▲                                                            │
+│     └──── Redis bus (deltas, events, stop frames) ◄────┐         │
+└───────────────────────────┬────────────────────────────┼─────────┘
+                            ▼                            │
+                 ┌──────── Postgres ────────┐            │
+                 │ jobs (SKIP LOCKED queue) │            │
+                 │ tasks, task_messages     │            │
+                 └────────────┬─────────────┘            │
+                              ▼ claim                    │
+┌──────────── cmd/worker (or in-process in cmd/server) ──┴─────────┐
+│ jobs.Worker ── registry ─┬─ task.run   ─► agent loop (below)     │
+│                          ├─ push.send  ─► APNs                   │
+│                          └─ email.send ─► mail provider (later)  │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+One `task.run` job is one run of the loop:
+
+```
+            claim task.run (key = task id)
+                        │
+                        ▼
+              ┌──────────────────┐
+              │ load messages    │◄──────────────────────────────┐
+              │ trim request copy│  (stored rows never change)   │
+              └────────┬─────────┘                               │
+                       ▼                                         │
+              ┌──────────────────┐   retryable error before      │
+              │ Fireworks stream │── any output ──► other model  │
+              │ speed: DeepSeek  │                  (fallback)   │
+              │ quality: GLM     │                               │
+              └────────┬─────────┘                               │
+     deltas ──► Redis  │  store assistant msg + usage (one tx)   │
+                       ▼                                         │
+               tool calls in reply?                              │
+          no ┌─────────┴──────────┐ yes                          │
+             ▼                    ▼                              │
+        ┌─────────┐     run each call in order                   │
+        │  idle   │     (shell, files, web_fetch, web_search,    │
+        │ done ✓  │      Gmail/GitHub MCP), store each result    │
+        └─────────┘               │                              │
+                                  ▼                              │
+                    ask/confirm? ── yes ──► park: save pending,  │
+                         │                  end job; /reply or   │
+                         │ no               /confirm enqueues    │
+                         ▼                  the next run         │
+              stuck (3 repeats / 3 failing steps)? ── yes ─► error
+                         │ no                                    │
+                         ▼                                       │
+              last step? ── yes ─► one tools-free wrap-up call ─► idle
+                         │ no                                    │
+                         └───────────────────────────────────────┘
+
+  /stop at any point ─► Redis stop frame ─► run context cancelled
+  worker crash ─► lease expires ─► job reclaimed; calls with no stored
+                  result become "Not run: the task was interrupted."
+```
+
 ## 1. Provider facts (Fireworks, as verified from official pages)
 
 Everything below was read from Fireworks pages (fireworks.ai/models, docs.fireworks.ai guides). Items I could not confirm are marked UNVERIFIED.
