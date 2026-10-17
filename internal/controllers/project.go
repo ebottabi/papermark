@@ -9,6 +9,7 @@ package controllers
 
 import (
 	"papermark/internal/handlers"
+	"papermark/internal/middleware"
 	"papermark/internal/responses"
 	"papermark/internal/services"
 
@@ -83,7 +84,7 @@ func NewProjectController(projects *services.ProjectService) *ProjectController 
 }
 
 func (h *ProjectController) List(c *fiber.Ctx) error {
-	list, err := h.projects.List(c.Context())
+	list, err := h.projects.List(c.Context(), middleware.UserID(c))
 	if err != nil {
 		return h.fail(c, err)
 	}
@@ -95,7 +96,7 @@ func (h *ProjectController) Create(c *fiber.Ctx) error {
 	if !ok {
 		return err
 	}
-	p, err := h.projects.Create(c.Context(), deref(f[0]), deref(f[1]))
+	p, err := h.projects.Create(c.Context(), middleware.UserID(c), deref(f[0]), deref(f[1]))
 	if err != nil {
 		return h.fail(c, err)
 	}
@@ -107,7 +108,7 @@ func (h *ProjectController) Update(c *fiber.Ctx) error {
 	if !ok {
 		return err
 	}
-	p, err := h.projects.Update(c.Context(), id, f[0], f[1])
+	p, err := h.projects.Update(c.Context(), middleware.UserID(c), id, f[0], f[1])
 	if err != nil {
 		return h.fail(c, err)
 	}
@@ -115,7 +116,9 @@ func (h *ProjectController) Update(c *fiber.Ctx) error {
 }
 
 func (h *ProjectController) Delete(c *fiber.Ctx) error {
-	return h.deleted(c, func(c *fiber.Ctx, id uuid.UUID) error { return h.projects.Delete(c.Context(), id) })
+	return h.deleted(c, func(c *fiber.Ctx, id uuid.UUID) error {
+		return h.projects.Delete(c.Context(), middleware.UserID(c), id)
+	})
 }
 
 // KnowledgeController serves /knowledge.
@@ -129,7 +132,7 @@ func NewKnowledgeController(knowledge *services.KnowledgeService) *KnowledgeCont
 }
 
 func (h *KnowledgeController) List(c *fiber.Ctx) error {
-	list, err := h.knowledge.List(c.Context())
+	list, err := h.knowledge.List(c.Context(), middleware.UserID(c))
 	if err != nil {
 		return h.fail(c, err)
 	}
@@ -145,7 +148,7 @@ func (h *KnowledgeController) Create(c *fiber.Ctx) error {
 	if !ok {
 		return h.SendBadRequest(c, "enabled must be a boolean")
 	}
-	k, err := h.knowledge.Create(c.Context(), deref(f[0]), deref(f[1]), enabled == nil || *enabled)
+	k, err := h.knowledge.Create(c.Context(), middleware.UserID(c), deref(f[0]), deref(f[1]), enabled == nil || *enabled)
 	if err != nil {
 		return h.fail(c, err)
 	}
@@ -161,7 +164,7 @@ func (h *KnowledgeController) Update(c *fiber.Ctx) error {
 	if !ok {
 		return h.SendBadRequest(c, "enabled must be a boolean")
 	}
-	k, err := h.knowledge.Update(c.Context(), id, f[0], f[1], enabled)
+	k, err := h.knowledge.Update(c.Context(), middleware.UserID(c), id, f[0], f[1], enabled)
 	if err != nil {
 		return h.fail(c, err)
 	}
@@ -169,7 +172,9 @@ func (h *KnowledgeController) Update(c *fiber.Ctx) error {
 }
 
 func (h *KnowledgeController) Delete(c *fiber.Ctx) error {
-	return h.deleted(c, func(c *fiber.Ctx, id uuid.UUID) error { return h.knowledge.Delete(c.Context(), id) })
+	return h.deleted(c, func(c *fiber.Ctx, id uuid.UUID) error {
+		return h.knowledge.Delete(c.Context(), middleware.UserID(c), id)
+	})
 }
 
 // SkillController serves /skills.
@@ -183,7 +188,7 @@ func NewSkillController(skills *services.SkillService) *SkillController {
 }
 
 func (h *SkillController) List(c *fiber.Ctx) error {
-	list, err := h.skills.List(c.Context())
+	list, err := h.skills.List(c.Context(), middleware.UserID(c))
 	if err != nil {
 		return h.fail(c, err)
 	}
@@ -195,7 +200,7 @@ func (h *SkillController) Create(c *fiber.Ctx) error {
 	if !ok {
 		return err
 	}
-	s, err := h.skills.Create(c.Context(), deref(f[0]), deref(f[1]), deref(f[2]))
+	s, err := h.skills.Create(c.Context(), middleware.UserID(c), deref(f[0]), deref(f[1]), deref(f[2]))
 	if err != nil {
 		return h.fail(c, err)
 	}
@@ -207,7 +212,7 @@ func (h *SkillController) Update(c *fiber.Ctx) error {
 	if !ok {
 		return err
 	}
-	s, err := h.skills.Update(c.Context(), id, f[0], f[1], f[2])
+	s, err := h.skills.Update(c.Context(), middleware.UserID(c), id, f[0], f[1], f[2])
 	if err != nil {
 		return h.fail(c, err)
 	}
@@ -215,5 +220,5 @@ func (h *SkillController) Update(c *fiber.Ctx) error {
 }
 
 func (h *SkillController) Delete(c *fiber.Ctx) error {
-	return h.deleted(c, func(c *fiber.Ctx, id uuid.UUID) error { return h.skills.Delete(c.Context(), id) })
+	return h.deleted(c, func(c *fiber.Ctx, id uuid.UUID) error { return h.skills.Delete(c.Context(), middleware.UserID(c), id) })
 }

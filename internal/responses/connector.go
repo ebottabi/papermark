@@ -10,16 +10,18 @@ import "papermark/internal/models"
 
 // ConnectorDTO is API.md's Connector.
 type ConnectorDTO struct {
-	Name   string  `json:"name"`
-	URL    string  `json:"url"`
-	Status string  `json:"status"`
-	Error  *string `json:"error"`
-	Tools  int     `json:"tools"`
+	Name    string  `json:"name"`
+	Kind    string  `json:"kind"`
+	URL     string  `json:"url"`
+	Status  string  `json:"status"`
+	Error   *string `json:"error"`
+	Tools   int     `json:"tools"`
+	Account *string `json:"account"`
 }
 
 // ConnectorResponse maps a connector onto its DTO.
 func ConnectorResponse(c *models.Connector) ConnectorDTO {
-	return ConnectorDTO{Name: c.Name, URL: c.URL, Status: c.Status, Error: c.Error, Tools: c.Tools}
+	return ConnectorDTO{Name: c.Name, Kind: c.Kind, URL: c.URL, Status: c.Status, Error: c.Error, Tools: c.Tools, Account: c.Account}
 }
 
 // ConnectorsResponse maps connectors onto DTOs (never null).

@@ -18,6 +18,6 @@ import (
 // Add a handler here when you add a job type.
 func NewRegistry(s *services.Services) *jobs.Registry {
 	r := jobs.NewRegistry()
-	r.Register(taskRun{s.Agent})
+	r.Register(chatTurn{s.Harness})
 	return r
 }

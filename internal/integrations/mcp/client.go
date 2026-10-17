@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"regexp"
 	"sort"
@@ -37,7 +38,8 @@ type Tool struct {
 
 // Session is an open connection to one MCP server.
 type Session struct {
-	s *sdkmcp.ClientSession
+	s    *sdkmcp.ClientSession
+	flag *authFlag
 }
 
 // authFlag is the transport's OAuth handler. It never runs an authorization
@@ -54,7 +56,8 @@ func (a *authFlag) TokenSource(context.Context) (oauth2.TokenSource, error) {
 	return flaggingSource{a}, nil
 }
 
-func (a *authFlag) Authorize(_ context.Context, _ *http.Request, resp *http.Response) error {
+func (a *authFlag) Authorize(_ context.Context, req *http.Request, resp *http.Response) error {
+	log.Printf("mcp: %s requires authorization: status=%d www-authenticate=%q", req.URL.Host, resp.StatusCode, resp.Header.Get("WWW-Authenticate"))
 	io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
 	a.needsAuth.Store(true)
@@ -92,7 +95,7 @@ func Connect(ctx context.Context, url string, ts oauth2.TokenSource, hc *http.Cl
 		}
 		return nil, err
 	}
-	return &Session{s: s}, nil
+	return &Session{s: s, flag: flag}, nil
 }
 
 // Tools lists every tool the server offers, sorted by name.
@@ -124,6 +127,9 @@ func (s *Session) Call(ctx context.Context, name string, args json.RawMessage) (
 	}
 	res, err := s.s.CallTool(ctx, &sdkmcp.CallToolParams{Name: name, Arguments: arguments})
 	if err != nil {
+		if s.flag.needsAuth.Load() {
+			return "", false, fmt.Errorf("%w: %v", ErrNeedsAuth, err)
+		}
 		return "", false, err
 	}
 	parts := make([]string, 0, len(res.Content))

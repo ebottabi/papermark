@@ -207,7 +207,7 @@ func expireToken(t *testing.T, pool *pgxpool.Pool) {
 
 func newConnectorAPI(t *testing.T, catalog ...map[string]config.ConnectorConfig) (*testAPI, *services.ConnectorService, *pgxpool.Pool) {
 	pool, _ := database.NewTestDatabase(t)
-	svc := services.NewConnectorService(pool, publicURL, append(catalog, nil)[0])
+	svc := services.NewConnectorService(pool, publicURL, append(catalog, nil)[0], nil)
 	return newAPI(t, &router.Config{Pool: pool, Connectors: controllers.NewConnectorController(svc)}), svc, pool
 }
 
@@ -249,7 +249,7 @@ func TestConnectorOAuthLifecycle(t *testing.T) {
 		t.Fatalf("list: %v", body)
 	}
 
-	cs, _ := queries.ListConnectors(ctx, pool)
+	cs, _ := queries.ListConnectors(ctx, pool, api.user)
 	cred, err := queries.GetOAuthCredential(ctx, pool, cs[0].ID)
 	if err != nil || cred.AccessToken != "at-1" || cred.RefreshToken != "rt-1" || cred.Verifier != "" || cred.StateHash != "" {
 		t.Fatalf("stored credential: %+v %v", cred, err)
@@ -262,7 +262,7 @@ func TestConnectorOAuthLifecycle(t *testing.T) {
 		}
 	}
 
-	set, err := svc.Snapshot(ctx)
+	set, err := svc.Snapshot(ctx, api.user)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -291,7 +291,7 @@ func TestConnectorOAuthLifecycle(t *testing.T) {
 	set.Close()
 
 	expireToken(t, pool)
-	set, err = svc.Snapshot(ctx)
+	set, err = svc.Snapshot(ctx, api.user)
 	if err != nil || len(set.Tools) != 3 || p.refreshes != 1 {
 		t.Fatalf("after expiry: %v tools=%d refreshes=%d", err, len(set.Tools), p.refreshes)
 	}
@@ -302,9 +302,9 @@ func TestConnectorOAuthLifecycle(t *testing.T) {
 
 	p.revoke()
 	expireToken(t, pool)
-	set, _ = svc.Snapshot(ctx)
+	set, _ = svc.Snapshot(ctx, api.user)
 	set.Close()
-	if c, _ := queries.GetConnectorByName(ctx, pool, "notes"); len(set.Tools) != 0 || c.Status != models.ConnectorNeedsAuth {
+	if c, _ := queries.GetConnectorByName(ctx, pool, api.user, "notes"); len(set.Tools) != 0 || c.Status != models.ConnectorNeedsAuth {
 		t.Fatalf("after revoke: tools=%d status=%s", len(set.Tools), c.Status)
 	}
 
@@ -392,12 +392,38 @@ func TestConnectorWithoutAuthAndUnreachable(t *testing.T) {
 	dead := httptest.NewServer(http.NotFoundHandler())
 	dead.Close()
 
-	api, _, _ := newConnectorAPI(t)
+	api, svc, pool := newConnectorAPI(t)
 	if code, body := api.do("POST", "/v1/connectors", `{"name":"open","url":"`+open.URL+`"}`); code != 201 || body.data()["status"] != "connected" || body.data()["tools"] != float64(1) {
 		t.Fatalf("open: %d %v", code, body)
 	}
 	code, body := api.do("POST", "/v1/connectors", `{"name":"dead","url":"`+dead.URL+`"}`)
 	if c := body.data(); code != 201 || c["status"] != "error" || c["error"] == nil || c["tools"] != float64(0) {
 		t.Fatalf("dead: %d %v", code, body)
+	}
+
+	// Another user sees none of them, cannot touch them, may reuse a name,
+	// and a task of theirs gets only their own tools.
+	other := api.as(newUser(t, pool))
+	if _, body := other.do("GET", "/v1/connectors", ""); len(body.data()["connectors"].([]any)) != 0 {
+		t.Fatalf("other user lists: %v", body)
+	}
+	if code, _ := other.do("DELETE", "/v1/connectors/open", ""); code != 404 {
+		t.Fatalf("other user deletes: %d", code)
+	}
+	if code, _ := other.do("POST", "/v1/connectors/open/authorize", ""); code != 404 {
+		t.Fatalf("other user authorizes: %d", code)
+	}
+	if set, err := svc.Snapshot(context.Background(), other.user); err != nil || len(set.Tools) != 0 {
+		t.Fatalf("other user's snapshot: %v %v", set, err)
+	}
+	if code, _ := other.do("POST", "/v1/connectors", `{"name":"dead","url":"`+dead.URL+`"}`); code != 201 {
+		t.Fatalf("other user reuses a name: %d", code)
+	}
+	set, err := svc.Snapshot(context.Background(), api.user)
+	if err != nil || len(set.Tools) != 1 {
+		t.Fatalf("owner's snapshot: %v %v", set, err)
+	}
+	if set.Close != nil {
+		set.Close()
 	}
 }

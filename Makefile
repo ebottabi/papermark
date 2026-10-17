@@ -1,6 +1,6 @@
 # Papermark Agent Server Makefile
 
-.PHONY: all build build-worker build-fake build-all run run-worker run-fake dev clean test test-race test-coverage lint fmt deps env deploy help
+.PHONY: all build build-worker build-all run run-worker dev clean test test-race test-coverage lint fmt deps env deploy help
 
 # Default target
 all: build
@@ -17,12 +17,8 @@ build-worker:
 	@go build -o bin/worker ./cmd/worker
 	@echo "Build complete: bin/worker"
 
-# Build the scripted Anthropic stand-in
-build-fake:
-	@go build -o bin/fakeanthropic ./cmd/fakeanthropic
-
 # Build all binaries
-build-all: build build-worker build-fake
+build-all: build build-worker
 
 # Run the server
 run: build
@@ -31,10 +27,6 @@ run: build
 # Run a standalone worker
 run-worker: build-worker
 	@./bin/worker
-
-# Run the fake Messages API on :8790 with the Lisbon script
-run-fake: build-fake
-	@./bin/fakeanthropic -port 8790 -script testdata/lisbon.json
 
 # Run in development mode with hot reload (requires air)
 dev:
@@ -89,11 +81,9 @@ help:
 	@echo "Papermark Agent Server - Available commands:"
 	@echo "  make build         - Build the server binary"
 	@echo "  make build-worker  - Build the worker binary"
-	@echo "  make build-fake    - Build the fake Anthropic API"
 	@echo "  make build-all     - Build all binaries"
 	@echo "  make run           - Build and run the server"
 	@echo "  make run-worker    - Build and run a standalone worker"
-	@echo "  make run-fake      - Build and run the fake Anthropic API on :8790"
 	@echo "  make dev           - Run with hot reload (requires air)"
 	@echo "  make clean         - Remove build artifacts"
 	@echo "  make test          - Run tests"

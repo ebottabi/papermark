@@ -14,8 +14,11 @@ import (
 	"testing"
 
 	"papermark/internal/database"
+	"papermark/internal/models"
 	"papermark/internal/models/queries"
 	"papermark/internal/notifications/apns"
+
+	"github.com/google/uuid"
 )
 
 type fakeSender struct {
@@ -34,24 +37,43 @@ func (f *fakeSender) Send(_ context.Context, token, env string, a apns.Alert) er
 	return nil
 }
 
-func TestSendReachesEveryDeviceAndPrunesDeadTokens(t *testing.T) {
+func TestSendReachesTheOwnersDevicesAndPrunesDeadTokens(t *testing.T) {
 	pool, _ := database.NewTestDatabase(t)
 	ctx := context.Background()
-	for _, d := range [][2]string{{"live", "sandbox"}, {"dead", "production"}} {
-		if _, err := queries.UpsertDevice(ctx, pool, d[0], "ios", d[1]); err != nil {
+	var users [2]uuid.UUID
+	for i, sub := range []string{"owner", "other"} {
+		u, _, err := queries.UpsertGoogleUser(ctx, pool, sub, sub+"@gmail.com", sub, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		users[i] = u.ID
+	}
+	for _, d := range []struct {
+		user       uuid.UUID
+		token, env string
+	}{{users[0], "live", "sandbox"}, {users[0], "dead", "production"}, {users[1], "theirs", "sandbox"}} {
+		if _, err := queries.UpsertDevice(ctx, pool, d.user, d.token, "ios", d.env); err != nil {
 			t.Fatal(err)
 		}
 	}
-	f := &fakeSender{dead: map[string]bool{"dead": true}}
-	if err := NewPushService(pool, f).Send(ctx, "task-1", "ask", "Which city?"); err != nil {
+	task := &models.Task{UserID: users[0], Prompt: "p", Status: models.TaskRunning, Mode: "quality"}
+	if err := queries.InsertTask(ctx, pool, task); err != nil {
 		t.Fatal(err)
 	}
-	if got := strings.Join(f.sent, ","); got != "live/sandbox/task-1/ask/Which city?,dead/production/task-1/ask/Which city?" {
+	id := task.ID.String()
+	f := &fakeSender{dead: map[string]bool{"dead": true}}
+	if err := NewPushService(pool, f).Send(ctx, id, "ask", "Which city?"); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(f.sent, ","); got != "live/sandbox/"+id+"/ask/Which city?,dead/production/"+id+"/ask/Which city?" {
 		t.Fatalf("sent %s", got)
 	}
-	left, _ := queries.ListDevices(ctx, pool)
+	left, _ := queries.ListDevices(ctx, pool, users[0])
 	if len(left) != 1 || left[0].Token != "live" {
 		t.Fatalf("devices after prune: %+v", left)
+	}
+	if theirs, _ := queries.ListDevices(ctx, pool, users[1]); len(theirs) != 1 {
+		t.Fatalf("other user's devices: %+v", theirs)
 	}
 }
 

@@ -36,9 +36,6 @@ func main() {
 
 	ctx := context.Background()
 	cfg := config.Load()
-	if cfg.APIToken == "" {
-		log.Fatal("API_TOKEN is required")
-	}
 
 	dbCfg := database.LoadPostgresConfig()
 	migrator, err := database.InitMigrator(dbCfg)
@@ -72,17 +69,21 @@ func main() {
 	svcs := services.New(cfg, pool, redisClient)
 
 	app := router.New(&router.Config{
-		APIToken:   cfg.APIToken,
-		BodyLimit:  cfg.BodyLimit,
-		Pool:       pool,
-		Redis:      redisClient,
-		Tasks:      controllers.NewTaskController(svcs.Tasks, svcs.Bus),
-		Projects:   controllers.NewProjectController(svcs.Projects),
-		Knowledge:  controllers.NewKnowledgeController(svcs.Knowledge),
-		Skills:     controllers.NewSkillController(svcs.Skills),
-		Devices:    controllers.NewDeviceController(svcs.Devices),
-		Schedules:  controllers.NewScheduleController(svcs.Schedules),
-		Connectors: controllers.NewConnectorController(svcs.MCP),
+		Authenticate: svcs.Auth.Authenticate,
+		BodyLimit:    cfg.BodyLimit,
+		Pool:         pool,
+		Redis:        redisClient,
+		Tasks:        controllers.NewTaskController(svcs.Tasks, svcs.Bus),
+		Projects:     controllers.NewProjectController(svcs.Projects),
+		Knowledge:    controllers.NewKnowledgeController(svcs.Knowledge),
+		Skills:       controllers.NewSkillController(svcs.Skills),
+		Devices:      controllers.NewDeviceController(svcs.Devices),
+		Schedules:    controllers.NewScheduleController(svcs.Schedules),
+		Connectors:   controllers.NewConnectorController(svcs.MCP),
+		Auth:         controllers.NewAuthController(svcs.Auth),
+		Prefs:        controllers.NewPreferencesController(svcs.Prefs),
+		Updates:      controllers.NewUpdateController(svcs.Updates),
+		Memories:     controllers.NewMemoryController(svcs.Memories),
 	})
 
 	workerCtx, workerCancel := context.WithCancel(context.Background())

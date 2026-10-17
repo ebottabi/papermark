@@ -7,14 +7,17 @@
 
 package models
 
+import "github.com/google/uuid"
+
 // Device is an APNs device token that receives push alerts. A token is
 // unique among live rows (partial index in PostMigrations), so registering
 // the same token again updates it in place.
 type Device struct {
 	Base
-	Token       string `gorm:"type:varchar(200);not null" json:"token"`
-	Platform    string `gorm:"type:varchar(16);not null;default:'ios'" json:"platform"`
-	Environment string `gorm:"type:varchar(16);not null" json:"environment"`
+	UserID      uuid.UUID `gorm:"type:uuid;not null;index" json:"userId"`
+	Token       string    `gorm:"type:varchar(200);not null" json:"token"`
+	Platform    string    `gorm:"type:varchar(16);not null;default:'ios'" json:"platform"`
+	Environment string    `gorm:"type:varchar(16);not null" json:"environment"`
 }
 
 // TableName for GORM.

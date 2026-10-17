@@ -28,6 +28,7 @@ const (
 // before it in the same assistant turn.
 type Task struct {
 	Base
+	UserID           uuid.UUID         `gorm:"type:uuid;not null;index" json:"userId"`
 	Prompt           string            `gorm:"type:text;not null" json:"prompt"`
 	Status           string            `gorm:"type:varchar(16);not null;index" json:"status"`
 	Mode             string            `gorm:"type:varchar(16);not null" json:"mode"`
@@ -56,6 +57,7 @@ type PendingAction struct {
 	Name      string  `json:"name"`
 	ToolUseID string  `json:"toolUseId"`
 	Answer    *string `json:"answer,omitempty"`
+	NoAlways  bool    `json:"noAlways,omitempty"` // confirm only: "always" is refused
 }
 
 // TaskEvent is one entry of a task's append-only event log. Data is the

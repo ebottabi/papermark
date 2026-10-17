@@ -17,6 +17,7 @@ import (
 	"papermark/internal/models/queries"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 func TestNextRun(t *testing.T) {
@@ -48,6 +49,10 @@ func TestNextRun(t *testing.T) {
 		{"hourly ignores the hour of time", "hourly", "17:15", nil, "2026-06-10T10:15:00-04:00", "2026-06-10T11:15:00-04:00"},
 		{"hourly through the repeated hour", "hourly", "00:30", nil, "2026-11-01T01:30:00-04:00", "2026-11-01T01:30:00-05:00"},
 		{"hourly over the skipped hour", "hourly", "00:30", nil, "2026-03-08T01:45:00-05:00", "2026-03-08T03:30:00-04:00"},
+		{"weekdays Friday evening goes to Monday", "weekdays", "09:00", nil, "2026-06-12T10:00:00-04:00", "2026-06-15T09:00:00-04:00"},
+		{"weekdays Sunday goes to Monday", "weekdays", "09:00", nil, "2026-06-14T12:00:00-04:00", "2026-06-15T09:00:00-04:00"},
+		{"weekdays Monday before the slot", "weekdays", "09:00", nil, "2026-06-15T08:00:00-04:00", "2026-06-15T09:00:00-04:00"},
+		{"weekdays across spring forward", "weekdays", "09:00", nil, "2026-03-06T10:00:00-05:00", "2026-03-09T09:00:00-04:00"},
 		{"weekly Monday from Sunday", "weekly", "09:00", wd(1), "2026-06-14T12:00:00-04:00", "2026-06-15T09:00:00-04:00"},
 		{"weekly Monday after the slot", "weekly", "09:00", wd(1), "2026-06-15T10:00:00-04:00", "2026-06-22T09:00:00-04:00"},
 		{"weekly Sunday is 7", "weekly", "18:00", wd(7), "2026-06-10T10:00:00-04:00", "2026-06-14T18:00:00-04:00"},
@@ -79,13 +84,14 @@ func TestNextRun(t *testing.T) {
 }
 
 type fakeTasks struct {
-	mu    sync.Mutex
-	calls map[uuid.UUID]int
-	fail  error
-	delay time.Duration
+	mu     sync.Mutex
+	calls  map[uuid.UUID]int
+	owners map[uuid.UUID]uuid.UUID // schedule -> the user its task was created for
+	fail   error
+	delay  time.Duration
 }
 
-func (f *fakeTasks) CreateTask(_ context.Context, _ queries.DBTX, prompt, mode string, projectID *uuid.UUID, scheduleID uuid.UUID) (string, error) {
+func (f *fakeTasks) CreateTask(_ context.Context, _ queries.DBTX, userID uuid.UUID, prompt, mode string, projectID *uuid.UUID, scheduleID uuid.UUID) (string, error) {
 	time.Sleep(f.delay)
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -93,9 +99,10 @@ func (f *fakeTasks) CreateTask(_ context.Context, _ queries.DBTX, prompt, mode s
 		return "", f.fail
 	}
 	if f.calls == nil {
-		f.calls = map[uuid.UUID]int{}
+		f.calls, f.owners = map[uuid.UUID]int{}, map[uuid.UUID]uuid.UUID{}
 	}
 	f.calls[scheduleID]++
+	f.owners[scheduleID] = userID
 	return uuid.NewString(), nil
 }
 
@@ -109,12 +116,23 @@ func (f *fakeTasks) total() int {
 	return n
 }
 
-func newSchedules(t *testing.T) (*ScheduleService, *fakeTasks) {
+func newSchedules(t *testing.T) (*ScheduleService, *fakeTasks, uuid.UUID) {
 	pool, _ := database.NewTestDatabase(t)
 	s := NewScheduleService(pool)
 	f := &fakeTasks{}
 	s.SetTaskCreator(f)
-	return s, f
+	return s, f, testUser(t, pool)
+}
+
+// testUser inserts a user and returns its id.
+func testUser(t *testing.T, pool *pgxpool.Pool) uuid.UUID {
+	t.Helper()
+	sub := uuid.NewString()
+	u, _, err := queries.UpsertGoogleUser(context.Background(), pool, sub, sub+"@gmail.com", "Test", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return u.ID
 }
 
 // backdate makes a schedule overdue by d.
@@ -126,9 +144,9 @@ func backdate(t *testing.T, s *ScheduleService, id uuid.UUID, d time.Duration) {
 }
 
 func TestRunDueRunsAMissedBacklogOnce(t *testing.T) {
-	s, f := newSchedules(t)
+	s, f, u := newSchedules(t)
 	ctx := context.Background()
-	sc, err := s.Create(ctx, ScheduleFields{Prompt: "news", Repeat: "daily", Time: "09:00", Enabled: true})
+	sc, err := s.Create(ctx, u, ScheduleFields{Prompt: "news", Repeat: "daily", Time: "09:00", Enabled: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,26 +162,26 @@ func TestRunDueRunsAMissedBacklogOnce(t *testing.T) {
 	if n, err := s.RunDue(ctx, now.Add(time.Second)); n != 0 || err != nil {
 		t.Fatalf("second tick: ran %d, %v", n, err)
 	}
-	got, _ := s.Get(ctx, sc.ID)
-	want, _ := NextRun("daily", "09:00", nil, now, time.Local)
+	got, _ := s.Get(ctx, u, sc.ID)
+	want, _ := NextRun("daily", "09:00", nil, now, time.UTC)
 	if got.NextRunAt == nil || !got.NextRunAt.Equal(want) || got.LastRunAt == nil {
 		t.Fatalf("after run: next %v (want %v) last %v", got.NextRunAt, want, got.LastRunAt)
 	}
-	if f.calls[sc.ID] != 1 {
+	if f.calls[sc.ID] != 1 || f.owners[sc.ID] != u {
 		t.Fatalf("tasks created: %v", f.calls)
 	}
 }
 
 func TestRunDueSkipsDisabledAndDeleted(t *testing.T) {
-	s, f := newSchedules(t)
+	s, f, u := newSchedules(t)
 	ctx := context.Background()
-	off, _ := s.Create(ctx, ScheduleFields{Prompt: "a", Repeat: "hourly", Time: "00:00", Enabled: false})
-	gone, _ := s.Create(ctx, ScheduleFields{Prompt: "b", Repeat: "hourly", Time: "00:00", Enabled: true})
+	off, _ := s.Create(ctx, u, ScheduleFields{Prompt: "a", Repeat: "hourly", Time: "00:00", Enabled: false})
+	gone, _ := s.Create(ctx, u, ScheduleFields{Prompt: "b", Repeat: "hourly", Time: "00:00", Enabled: true})
 	if off.NextRunAt != nil {
 		t.Fatalf("disabled schedule has next run %v", off.NextRunAt)
 	}
 	backdate(t, s, gone.ID, time.Hour)
-	if err := s.Delete(ctx, gone.ID); err != nil {
+	if err := s.Delete(ctx, u, gone.ID); err != nil {
 		t.Fatal(err)
 	}
 	if n, err := s.RunDue(ctx, time.Now()); n != 0 || err != nil || f.total() != 0 {
@@ -172,17 +190,17 @@ func TestRunDueSkipsDisabledAndDeleted(t *testing.T) {
 }
 
 func TestRunDueRetriesAfterTaskCreationFails(t *testing.T) {
-	s, f := newSchedules(t)
+	s, f, u := newSchedules(t)
 	ctx := context.Background()
-	sc, _ := s.Create(ctx, ScheduleFields{Prompt: "a", Repeat: "daily", Time: "09:00", Enabled: true})
+	sc, _ := s.Create(ctx, u, ScheduleFields{Prompt: "a", Repeat: "daily", Time: "09:00", Enabled: true})
 	backdate(t, s, sc.ID, time.Minute)
-	before, _ := s.Get(ctx, sc.ID)
+	before, _ := s.Get(ctx, u, sc.ID)
 
 	f.fail = errors.New("db down")
 	if _, err := s.RunDue(ctx, time.Now()); err == nil {
 		t.Fatal("expected the creation error")
 	}
-	after, _ := s.Get(ctx, sc.ID)
+	after, _ := s.Get(ctx, u, sc.ID)
 	if !after.NextRunAt.Equal(*before.NextRunAt) || after.LastRunAt != nil {
 		t.Fatalf("failed run advanced the schedule: %v -> %v", before.NextRunAt, after.NextRunAt)
 	}
@@ -196,6 +214,7 @@ func TestConcurrentSchedulersNeverDoubleRun(t *testing.T) {
 	pool, _ := database.NewTestDatabase(t)
 	ctx := context.Background()
 	f := &fakeTasks{delay: 5 * time.Millisecond}
+	u := testUser(t, pool)
 	var schedulers []*ScheduleService
 	for i := 0; i < 4; i++ { // four processes sharing one database
 		s := NewScheduleService(pool)
@@ -204,7 +223,7 @@ func TestConcurrentSchedulersNeverDoubleRun(t *testing.T) {
 	}
 	const due = 12
 	for i := 0; i < due; i++ {
-		sc, err := schedulers[0].Create(ctx, ScheduleFields{Prompt: "p", Repeat: "hourly", Time: "00:00", Enabled: true})
+		sc, err := schedulers[0].Create(ctx, u, ScheduleFields{Prompt: "p", Repeat: "hourly", Time: "00:00", Enabled: true})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -228,7 +247,7 @@ func TestConcurrentSchedulersNeverDoubleRun(t *testing.T) {
 	if len(f.calls) != due || f.total() != due {
 		t.Fatalf("want %d schedules run once each, got %v", due, f.calls)
 	}
-	left, _ := queries.ListSchedules(ctx, pool)
+	left, _ := queries.ListSchedules(ctx, pool, u)
 	for _, sc := range left {
 		if !sc.NextRunAt.After(now) {
 			t.Fatalf("schedule %s still due: %v", sc.ID, sc.NextRunAt)

@@ -22,6 +22,7 @@ import (
 
 	"papermark/internal/cache"
 	"papermark/internal/handlers"
+	"papermark/internal/middleware"
 	"papermark/internal/responses"
 	"papermark/internal/services"
 	"papermark/internal/storage"
@@ -63,7 +64,7 @@ func (h *TaskController) List(c *fiber.Ctx) error {
 		}
 		project = &id
 	}
-	list, err := h.tasks.List(c.Context(), c.Query("archived") == "true", project)
+	list, err := h.tasks.List(c.Context(), middleware.UserID(c), c.Query("archived") == "true", project)
 	if err != nil {
 		return h.fail(c, err)
 	}
@@ -83,7 +84,7 @@ func (h *TaskController) Create(c *fiber.Ctx) error {
 	if !ok {
 		return h.SendBadRequest(c, "mode must be speed or quality")
 	}
-	in := services.NewTask{Prompt: *prompt, Mode: deref(mode), Attachments: b.raw("attachments")}
+	in := services.NewTask{UserID: middleware.UserID(c), Prompt: *prompt, Mode: deref(mode), Attachments: b.raw("attachments")}
 	if raw, present := b["projectId"]; present && raw != nil {
 		s, ok := raw.(string)
 		if !ok {
@@ -107,7 +108,7 @@ func (h *TaskController) Get(c *fiber.Ctx) error {
 	if !ok {
 		return h.SendNotFound(c, noSuchTask)
 	}
-	t, err := h.tasks.Get(c.Context(), id)
+	t, err := h.tasks.Get(c.Context(), middleware.UserID(c), id)
 	if err != nil {
 		return h.fail(c, err)
 	}
@@ -135,7 +136,7 @@ func (h *TaskController) Patch(c *fiber.Ctx) error {
 	if !ok {
 		return h.SendBadRequest(c, "archived must be a boolean")
 	}
-	t, err := h.tasks.Patch(c.Context(), id, favorite, archived)
+	t, err := h.tasks.Patch(c.Context(), middleware.UserID(c), id, favorite, archived)
 	if err != nil {
 		return h.fail(c, err)
 	}
@@ -150,7 +151,7 @@ func (h *TaskController) Confirm(c *fiber.Ctx) error {
 	return h.answer(c, "decision", "decision must be allow, always or deny", h.tasks.Confirm)
 }
 
-func (h *TaskController) answer(c *fiber.Ctx, field, missing string, call func(context.Context, uuid.UUID, string) error) error {
+func (h *TaskController) answer(c *fiber.Ctx, field, missing string, call func(context.Context, uuid.UUID, uuid.UUID, string) error) error {
 	id, ok := idParam(c)
 	if !ok {
 		return h.SendNotFound(c, noSuchTask)
@@ -163,7 +164,7 @@ func (h *TaskController) answer(c *fiber.Ctx, field, missing string, call func(c
 	if !ok || v == nil {
 		return h.SendBadRequest(c, missing)
 	}
-	if err := call(c.Context(), id, *v); err != nil {
+	if err := call(c.Context(), middleware.UserID(c), id, *v); err != nil {
 		return h.fail(c, err)
 	}
 	return h.SendSuccess(c, fiber.Map{"ok": true})
@@ -182,7 +183,7 @@ func (h *TaskController) Message(c *fiber.Ctx) error {
 	if !ok {
 		return h.SendBadRequest(c, "text is required")
 	}
-	if err := h.tasks.Message(c.Context(), id, deref(text), b.raw("attachments")); err != nil {
+	if err := h.tasks.Message(c.Context(), middleware.UserID(c), id, deref(text), b.raw("attachments")); err != nil {
 		return h.fail(c, err)
 	}
 	return h.SendAccepted(c, fiber.Map{"ok": true})
@@ -193,7 +194,7 @@ func (h *TaskController) Stop(c *fiber.Ctx) error {
 	if !ok {
 		return h.SendNotFound(c, noSuchTask)
 	}
-	if err := h.tasks.Stop(c.Context(), id); err != nil {
+	if err := h.tasks.Stop(c.Context(), middleware.UserID(c), id); err != nil {
 		return h.fail(c, err)
 	}
 	return h.SendSuccess(c, fiber.Map{"ok": true})
@@ -212,7 +213,7 @@ func (h *TaskController) Fork(c *fiber.Ctx) error {
 	if !ok {
 		return h.SendBadRequest(c, "task is required")
 	}
-	fork, err := h.tasks.Fork(c.Context(), id, deref(prompt))
+	fork, err := h.tasks.Fork(c.Context(), middleware.UserID(c), id, deref(prompt))
 	if err != nil {
 		return h.fail(c, err)
 	}
@@ -224,7 +225,7 @@ func (h *TaskController) Files(c *fiber.Ctx) error {
 	if !ok {
 		return h.SendNotFound(c, noSuchTask)
 	}
-	files, err := h.tasks.Files(c.Context(), id)
+	files, err := h.tasks.Files(c.Context(), middleware.UserID(c), id)
 	if err != nil {
 		return h.fail(c, err)
 	}
@@ -241,7 +242,7 @@ func (h *TaskController) File(c *fiber.Ctx) error {
 	if err != nil {
 		return h.SendBadRequest(c, "bad path")
 	}
-	f, info, err := h.tasks.OpenFile(c.Context(), id, rel)
+	f, info, err := h.tasks.OpenFile(c.Context(), middleware.UserID(c), id, rel)
 	switch {
 	case errors.Is(err, storage.ErrEscape):
 		return h.SendBadRequest(c, "path escapes the workspace")
@@ -263,7 +264,7 @@ func (h *TaskController) Transcript(c *fiber.Ctx) error {
 	if !ok {
 		return h.SendNotFound(c, noSuchTask)
 	}
-	md, err := h.tasks.Transcript(c.Context(), id)
+	md, err := h.tasks.Transcript(c.Context(), middleware.UserID(c), id)
 	if err != nil {
 		return h.fail(c, err)
 	}
@@ -277,7 +278,7 @@ func (h *TaskController) Usage(c *fiber.Ctx) error {
 		days = 30
 	}
 	days = min(max(days, 1), 366)
-	list, total, err := h.tasks.UsageByDay(c.Context(), days)
+	list, total, err := h.tasks.UsageByDay(c.Context(), middleware.UserID(c), days)
 	if err != nil {
 		return h.fail(c, err)
 	}
@@ -300,7 +301,7 @@ func (h *TaskController) Events(c *fiber.Ctx) error {
 	if err != nil {
 		last = -1
 	}
-	if _, err := h.tasks.Get(c.Context(), id); err != nil {
+	if _, err := h.tasks.Get(c.Context(), middleware.UserID(c), id); err != nil {
 		return h.fail(c, err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -341,6 +342,9 @@ func (h *TaskController) Events(c *fiber.Ctx) error {
 				case f.Kind == cache.FrameDelta:
 					text, _ := json.Marshal(map[string]string{"text": f.Text})
 					_, _ = io.WriteString(w, "event: delta\ndata: "+string(text)+"\n\n")
+				case f.Kind == cache.FrameActivity:
+					name, _ := json.Marshal(map[string]string{"name": f.Text})
+					_, _ = io.WriteString(w, "event: activity\ndata: "+string(name)+"\n\n")
 				case f.Kind != cache.FrameEvent || f.Seq <= last:
 					continue
 				case f.Seq == last+1:

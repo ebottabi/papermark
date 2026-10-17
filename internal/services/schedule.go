@@ -11,8 +11,12 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"time"
+	_ "time/tzdata" // zone names must resolve on hosts without a zoneinfo database
+	"unicode/utf8"
 
+	"papermark/internal/harness"
 	"papermark/internal/models"
 	"papermark/internal/models/queries"
 
@@ -22,15 +26,27 @@ import (
 
 // Schedule repeat values.
 const (
-	RepeatHourly = "hourly"
-	RepeatDaily  = "daily"
-	RepeatWeekly = "weekly"
+	RepeatHourly   = "hourly"
+	RepeatDaily    = "daily"
+	RepeatWeekdays = "weekdays"
+	RepeatWeekly   = "weekly"
+)
+
+// BriefTitle and BriefPrompt fill a brief schedule created without them. The
+// run learns the user's time zone and news topics from its routine guidance.
+const (
+	BriefTitle  = "Morning brief"
+	BriefPrompt = `Prepare my morning brief.
+1. Email: if you have a gmail_digest tool, call it with sinceLast true and pick the few messages that matter (people, deadlines, anything needing a reply). If you have no gmail tool, skip email.
+2. News: search the web for the latest on my news topics (or the general top headlines if I have none) and keep the few most important stories. Use web_fetch on a page only when the search snippet is not enough.
+3. Weather: find today's weather for the main city of my time zone. If you cannot get it reliably, skip it.
+Then call publish_update once with importance feed, title "Morning brief", a one-line body, and sections named Email, News and Weather (leave out any section with nothing in it). Keep items short. For Email items put the sender in detail. For News items put the article link in url.`
 )
 
 // TaskCreator starts a task. The task service satisfies it; a schedule run
 // passes its own id so the task carries scheduleId.
 type TaskCreator interface {
-	CreateTask(ctx context.Context, db queries.DBTX, prompt, mode string, projectID *uuid.UUID, scheduleID uuid.UUID) (id string, err error)
+	CreateTask(ctx context.Context, db queries.DBTX, userID uuid.UUID, prompt, mode string, projectID *uuid.UUID, scheduleID uuid.UUID) (id string, err error)
 }
 
 // ErrInvalidSchedule wraps every schedule validation failure.
@@ -43,12 +59,12 @@ var ErrNoTaskCreator = errors.New("schedules: no task creator configured")
 type ScheduleService struct {
 	pool  *pgxpool.Pool
 	tasks TaskCreator
-	loc   *time.Location
 }
 
-// NewScheduleService constructs a ScheduleService computing slots in time.Local.
+// NewScheduleService constructs a ScheduleService. Slots are computed in each
+// schedule owner's time zone.
 func NewScheduleService(pool *pgxpool.Pool) *ScheduleService {
-	return &ScheduleService{pool: pool, loc: time.Local}
+	return &ScheduleService{pool: pool}
 }
 
 // SetTaskCreator wires the service that creates tasks for runs.
@@ -56,6 +72,8 @@ func (s *ScheduleService) SetTaskCreator(tc TaskCreator) { s.tasks = tc }
 
 // ScheduleFields are the user-editable fields of a schedule.
 type ScheduleFields struct {
+	Title     string
+	Kind      string
 	Prompt    string
 	Mode      string
 	ProjectID *uuid.UUID
@@ -65,20 +83,24 @@ type ScheduleFields struct {
 	Enabled   bool
 }
 
-// List returns every schedule.
-func (s *ScheduleService) List(ctx context.Context) ([]*models.Schedule, error) {
-	return queries.ListSchedules(ctx, s.pool)
+// List returns the user's schedules.
+func (s *ScheduleService) List(ctx context.Context, user uuid.UUID) ([]*models.Schedule, error) {
+	return queries.ListSchedules(ctx, s.pool, user)
 }
 
-// Get returns one schedule.
-func (s *ScheduleService) Get(ctx context.Context, id uuid.UUID) (*models.Schedule, error) {
-	return queries.GetSchedule(ctx, s.pool, id)
+// Get returns one of the user's schedules.
+func (s *ScheduleService) Get(ctx context.Context, user, id uuid.UUID) (*models.Schedule, error) {
+	return queries.GetSchedule(ctx, s.pool, user, id)
 }
 
 // Create validates f and stores a schedule whose first run is the next slot.
-func (s *ScheduleService) Create(ctx context.Context, f ScheduleFields) (*models.Schedule, error) {
-	sc := &models.Schedule{}
-	if err := s.apply(sc, f, time.Now()); err != nil {
+func (s *ScheduleService) Create(ctx context.Context, user uuid.UUID, f ScheduleFields) (*models.Schedule, error) {
+	sc := &models.Schedule{UserID: user}
+	loc, err := userLocation(ctx, s.pool, user)
+	if err != nil {
+		return nil, err
+	}
+	if err := apply(sc, f, time.Now(), loc); err != nil {
 		return nil, err
 	}
 	if err := queries.CreateSchedule(ctx, s.pool, sc); err != nil {
@@ -88,12 +110,16 @@ func (s *ScheduleService) Create(ctx context.Context, f ScheduleFields) (*models
 }
 
 // Update replaces the editable fields of schedule id with f and recomputes the next slot.
-func (s *ScheduleService) Update(ctx context.Context, id uuid.UUID, f ScheduleFields) (*models.Schedule, error) {
-	sc, err := queries.GetSchedule(ctx, s.pool, id)
+func (s *ScheduleService) Update(ctx context.Context, user, id uuid.UUID, f ScheduleFields) (*models.Schedule, error) {
+	sc, err := queries.GetSchedule(ctx, s.pool, user, id)
 	if err != nil {
 		return nil, err
 	}
-	if err := s.apply(sc, f, time.Now()); err != nil {
+	loc, err := userLocation(ctx, s.pool, user)
+	if err != nil {
+		return nil, err
+	}
+	if err := apply(sc, f, time.Now(), loc); err != nil {
 		return nil, err
 	}
 	if err := queries.UpdateSchedule(ctx, s.pool, sc); err != nil {
@@ -102,21 +128,27 @@ func (s *ScheduleService) Update(ctx context.Context, id uuid.UUID, f ScheduleFi
 	return sc, nil
 }
 
+// CreateRoutine creates an enabled custom schedule on behalf of the agent.
+func (s *ScheduleService) CreateRoutine(ctx context.Context, user uuid.UUID, r harness.RoutineSpec) (*models.Schedule, error) {
+	return s.Create(ctx, user, ScheduleFields{Title: r.Title, Kind: models.ScheduleCustom, Prompt: r.Prompt,
+		Repeat: r.Repeat, Time: r.Time, Weekday: r.Weekday, Enabled: true})
+}
+
 // Delete removes schedule id.
-func (s *ScheduleService) Delete(ctx context.Context, id uuid.UUID) error {
-	return queries.SoftDeleteSchedule(ctx, s.pool, id)
+func (s *ScheduleService) Delete(ctx context.Context, user, id uuid.UUID) error {
+	return queries.SoftDeleteSchedule(ctx, s.pool, user, id)
 }
 
 // RunNow creates the schedule's task immediately. The next slot is unchanged.
-func (s *ScheduleService) RunNow(ctx context.Context, id uuid.UUID) (string, error) {
+func (s *ScheduleService) RunNow(ctx context.Context, user, id uuid.UUID) (string, error) {
 	if s.tasks == nil {
 		return "", ErrNoTaskCreator
 	}
-	sc, err := queries.GetSchedule(ctx, s.pool, id)
+	sc, err := queries.GetSchedule(ctx, s.pool, user, id)
 	if err != nil {
 		return "", err
 	}
-	taskID, err := s.tasks.CreateTask(ctx, s.pool, sc.Prompt, sc.Mode, sc.ProjectID, sc.ID)
+	taskID, err := s.tasks.CreateTask(ctx, s.pool, sc.UserID, sc.Prompt, sc.Mode, sc.ProjectID, sc.ID)
 	if err != nil {
 		return "", err
 	}
@@ -156,7 +188,11 @@ func (s *ScheduleService) runOneDue(ctx context.Context, now time.Time) (bool, e
 	if err != nil {
 		return false, err
 	}
-	next, err := NextRun(sc.Repeat, sc.TimeOfDay, sc.Weekday, now, s.loc)
+	loc, err := userLocation(ctx, tx, sc.UserID)
+	if err != nil {
+		return false, err
+	}
+	next, err := NextRun(sc.Repeat, sc.TimeOfDay, sc.Weekday, now, loc)
 	if err != nil {
 		return false, err
 	}
@@ -164,7 +200,7 @@ func (s *ScheduleService) runOneDue(ctx context.Context, now time.Time) (bool, e
 		return false, err
 	}
 	// The task commits with the claim; the job worker's poll picks up its run.
-	taskID, err := s.tasks.CreateTask(ctx, tx, sc.Prompt, sc.Mode, sc.ProjectID, sc.ID)
+	taskID, err := s.tasks.CreateTask(ctx, tx, sc.UserID, sc.Prompt, sc.Mode, sc.ProjectID, sc.ID)
 	if err != nil {
 		return false, fmt.Errorf("schedule %s: create task: %w", sc.ID, err)
 	}
@@ -175,10 +211,32 @@ func (s *ScheduleService) runOneDue(ctx context.Context, now time.Time) (bool, e
 	return true, nil
 }
 
-// apply validates f onto sc and sets the next slot after now (nil when disabled).
-func (s *ScheduleService) apply(sc *models.Schedule, f ScheduleFields, now time.Time) error {
+// apply validates f onto sc and sets the next slot after now in loc (nil when disabled).
+// A brief without a prompt or title gets BriefPrompt and BriefTitle; a custom
+// schedule without a title gets the start of its prompt.
+func apply(sc *models.Schedule, f ScheduleFields, now time.Time, loc *time.Location) error {
+	if f.Kind == "" {
+		f.Kind = models.ScheduleCustom
+	}
+	if f.Kind != models.ScheduleCustom && f.Kind != models.ScheduleBrief {
+		return fmt.Errorf("%w: kind must be custom or brief", ErrInvalidSchedule)
+	}
+	if f.Kind == models.ScheduleBrief {
+		if f.Prompt == "" {
+			f.Prompt = BriefPrompt
+		}
+		if strings.TrimSpace(f.Title) == "" {
+			f.Title = BriefTitle
+		}
+	}
 	if f.Prompt == "" {
 		return fmt.Errorf("%w: prompt is required", ErrInvalidSchedule)
+	}
+	if strings.TrimSpace(f.Title) == "" {
+		f.Title = titleOf(f.Prompt)
+	}
+	if utf8.RuneCountInString(f.Title) > 120 {
+		return fmt.Errorf("%w: title must be at most 120 characters", ErrInvalidSchedule)
 	}
 	if f.Mode == "" {
 		f.Mode = "quality"
@@ -189,10 +247,11 @@ func (s *ScheduleService) apply(sc *models.Schedule, f ScheduleFields, now time.
 	if f.Repeat != RepeatWeekly {
 		f.Weekday = nil
 	}
-	next, err := NextRun(f.Repeat, f.Time, f.Weekday, now, s.loc)
+	next, err := NextRun(f.Repeat, f.Time, f.Weekday, now, loc)
 	if err != nil {
 		return err
 	}
+	sc.Title, sc.Kind = strings.TrimSpace(f.Title), f.Kind
 	sc.Prompt, sc.Mode, sc.ProjectID = f.Prompt, f.Mode, f.ProjectID
 	sc.Repeat, sc.TimeOfDay, sc.Weekday, sc.Enabled = f.Repeat, f.Time, f.Weekday, f.Enabled
 	sc.NextRunAt = nil
@@ -203,9 +262,24 @@ func (s *ScheduleService) apply(sc *models.Schedule, f ScheduleFields, now time.
 	return nil
 }
 
+// titleOf is the first 40 characters of prompt with whitespace collapsed.
+func titleOf(prompt string) string {
+	t := []rune(strings.Join(strings.Fields(prompt), " "))
+	return string(t[:min(len(t), 40)])
+}
+
+// userLocation is the time zone of user's slots.
+func userLocation(ctx context.Context, db queries.DBTX, user uuid.UUID) (*time.Location, error) {
+	p, err := queries.GetPreferences(ctx, db, user)
+	if err != nil {
+		return nil, err
+	}
+	return time.LoadLocation(p.Timezone)
+}
+
 // NextRun returns the first slot strictly after after, in loc.
-// hourly fires at minute MM of every hour, daily at HH:MM, weekly at HH:MM on
-// weekday (1 Monday to 7 Sunday). Wall-clock slots are built with time.Date,
+// hourly fires at minute MM of every hour, daily at HH:MM, weekdays at HH:MM
+// Monday to Friday, weekly at HH:MM on weekday (1 Monday to 7 Sunday). Wall-clock slots are built with time.Date,
 // so they stay at HH:MM local across DST changes. A repeated wall time (fall
 // back) resolves to its first occurrence; one inside a spring-forward gap
 // resolves with the pre-transition offset, an hour earlier on the wall clock.
@@ -230,6 +304,13 @@ func NextRun(repeat, hhmm string, weekday *int, after time.Time, loc *time.Locat
 			c = time.Date(t.Year(), t.Month(), t.Day()+1, h, m, 0, 0, loc)
 		}
 		return c, nil
+	case RepeatWeekdays:
+		for i := 0; ; i++ {
+			c := time.Date(t.Year(), t.Month(), t.Day()+i, h, m, 0, 0, loc)
+			if wd := c.Weekday(); wd != time.Saturday && wd != time.Sunday && c.After(after) {
+				return c, nil
+			}
+		}
 	case RepeatWeekly:
 		if weekday == nil || *weekday < 1 || *weekday > 7 {
 			return time.Time{}, fmt.Errorf("%w: weekly needs weekday 1-7", ErrInvalidSchedule)
@@ -242,6 +323,6 @@ func NextRun(repeat, hhmm string, weekday *int, after time.Time, loc *time.Locat
 		}
 		return c, nil
 	default:
-		return time.Time{}, fmt.Errorf("%w: repeat must be hourly, daily or weekly", ErrInvalidSchedule)
+		return time.Time{}, fmt.Errorf("%w: repeat must be hourly, daily, weekdays or weekly", ErrInvalidSchedule)
 	}
 }

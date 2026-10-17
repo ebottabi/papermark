@@ -12,6 +12,7 @@ import (
 	"net/url"
 
 	"papermark/internal/handlers"
+	"papermark/internal/middleware"
 	"papermark/internal/models"
 	"papermark/internal/models/queries"
 	"papermark/internal/responses"
@@ -39,7 +40,7 @@ type AddConnectorRequest struct {
 
 // List handles GET /v1/connectors.
 func (c *ConnectorController) List(ctx *fiber.Ctx) error {
-	cs, err := c.connectorService.List(ctx.Context())
+	cs, err := c.connectorService.List(ctx.Context(), middleware.UserID(ctx))
 	if err != nil {
 		return c.SendInternalError(ctx, "failed to list connectors")
 	}
@@ -52,7 +53,7 @@ func (c *ConnectorController) Add(ctx *fiber.Ctx) error {
 	if err := ctx.BodyParser(&req); err != nil {
 		return c.SendBadRequest(ctx, "invalid request body")
 	}
-	conn, err := c.connectorService.Add(ctx.Context(), req.Name, req.URL)
+	conn, err := c.connectorService.Add(ctx.Context(), middleware.UserID(ctx), req.Name, req.URL)
 	switch {
 	case errors.Is(err, services.ErrInvalidConnector):
 		return c.SendBadRequest(ctx, err.Error())
@@ -66,7 +67,7 @@ func (c *ConnectorController) Add(ctx *fiber.Ctx) error {
 
 // Delete handles DELETE /v1/connectors/:name.
 func (c *ConnectorController) Delete(ctx *fiber.Ctx) error {
-	err := c.connectorService.Delete(ctx.Context(), ctx.Params("name"))
+	err := c.connectorService.Delete(ctx.Context(), middleware.UserID(ctx), ctx.Params("name"))
 	switch {
 	case errors.Is(err, queries.ErrNotFound):
 		return c.SendNotFound(ctx, "connector not found")
@@ -78,7 +79,7 @@ func (c *ConnectorController) Delete(ctx *fiber.Ctx) error {
 
 // Authorize handles POST /v1/connectors/:name/authorize.
 func (c *ConnectorController) Authorize(ctx *fiber.Ctx) error {
-	u, err := c.connectorService.Authorize(ctx.Context(), ctx.Params("name"))
+	u, err := c.connectorService.Authorize(ctx.Context(), middleware.UserID(ctx), ctx.Params("name"))
 	switch {
 	case errors.Is(err, queries.ErrNotFound):
 		return c.SendNotFound(ctx, "connector not found")

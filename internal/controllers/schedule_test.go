@@ -19,9 +19,10 @@ import (
 	"github.com/google/uuid"
 )
 
-type recordingTasks struct{ scheduleIDs []uuid.UUID }
+type recordingTasks struct{ userIDs, scheduleIDs []uuid.UUID }
 
-func (r *recordingTasks) CreateTask(_ context.Context, _ queries.DBTX, _, _ string, _ *uuid.UUID, scheduleID uuid.UUID) (string, error) {
+func (r *recordingTasks) CreateTask(_ context.Context, _ queries.DBTX, userID uuid.UUID, _, _ string, _ *uuid.UUID, scheduleID uuid.UUID) (string, error) {
+	r.userIDs = append(r.userIDs, userID)
 	r.scheduleIDs = append(r.scheduleIDs, scheduleID)
 	return "task-1", nil
 }
@@ -63,8 +64,18 @@ func TestSchedulesAPI(t *testing.T) {
 	}
 
 	code, body = api.do("POST", "/v1/schedules/"+id+"/run", "")
-	if code != 201 || body.data()["id"] != "task-1" || len(tasks.scheduleIDs) != 1 || tasks.scheduleIDs[0].String() != id {
+	if code != 201 || body.data()["id"] != "task-1" || len(tasks.scheduleIDs) != 1 || tasks.scheduleIDs[0].String() != id || tasks.userIDs[0] != api.user {
 		t.Fatalf("run: %d %v %v", code, body, tasks.scheduleIDs)
+	}
+
+	other := api.as(newUser(t, pool))
+	if _, body := other.do("GET", "/v1/schedules", ""); len(body.data()["schedules"].([]any)) != 0 {
+		t.Fatalf("other user lists: %v", body)
+	}
+	for _, r := range [][2]string{{"PATCH", ""}, {"POST", "/run"}, {"DELETE", ""}} {
+		if code, _ := other.do(r[0], "/v1/schedules/"+id+r[1], `{"enabled":false}`); code != 404 {
+			t.Fatalf("other user %s %s: %d", r[0], r[1], code)
+		}
 	}
 	code, body = api.do("GET", "/v1/schedules", "")
 	list, _ := body.data()["schedules"].([]any)

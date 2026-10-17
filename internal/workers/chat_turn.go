@@ -10,19 +10,19 @@ import (
 	"context"
 	"encoding/json"
 
+	"papermark/internal/harness"
 	"papermark/internal/models"
-	"papermark/internal/services"
 )
 
-// taskRun runs a task's agent loop (job type services.RunTaskJob).
-type taskRun struct{ agent *services.AgentService }
+// chatTurn runs a task's chat turn (job type harness.TurnJob).
+type chatTurn struct{ h *harness.Harness }
 
-func (taskRun) Type() string { return services.RunTaskJob }
+func (chatTurn) Type() string { return harness.TurnJob }
 
-func (h taskRun) Handle(ctx context.Context, job *models.Job) error {
-	var p services.RunTaskPayload
+func (c chatTurn) Handle(ctx context.Context, job *models.Job) error {
+	var p harness.TurnPayload
 	if err := json.Unmarshal(job.Payload, &p); err != nil {
 		return err
 	}
-	return h.agent.Run(ctx, p.TaskID)
+	return c.h.ChatTurn(ctx, p.TaskID)
 }

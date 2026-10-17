@@ -9,10 +9,13 @@ package config
 
 import (
 	"log"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
 	"time"
+
+	"papermark/internal/secretbox"
 
 	"github.com/joho/godotenv"
 )
@@ -26,8 +29,7 @@ type Config struct {
 	Environment string
 	PublicURL   string
 
-	// APIToken is the bearer token every /v1 request must carry.
-	APIToken string
+	Auth AuthConfig
 
 	// WorkspaceDir holds one directory per task: WorkspaceDir/<task id>.
 	WorkspaceDir string
@@ -35,24 +37,45 @@ type Config struct {
 	// BodyLimit caps request bodies (attachments are base64 in JSON).
 	BodyLimit int
 
+	// TokenKey encrypts OAuth tokens at rest (AES-256-GCM); nil stores them in plaintext.
+	TokenKey []byte
+
 	Agent  AgentConfig
 	Worker WorkerConfig
 	APNS   APNSConfig
+	Ntfy   NtfyConfig
 
 	// Connectors is the fixed catalog the app offers, by connector name.
 	Connectors map[string]ConnectorConfig
 }
 
-// ConnectorConfig is one catalog connector: its MCP server and, for
-// providers without dynamic client registration, a pre-registered OAuth client.
-// Scopes replaces the broad list the server advertises; AuthParams are extra
-// authorization URL parameters.
+// ConnectorConfig is one catalog connector: its MCP server (or, for Kind
+// "gmail", the Gmail API origin) and, for providers without dynamic client
+// registration, a pre-registered OAuth client. Scopes replaces the broad list
+// the server advertises; AuthParams are extra authorization URL parameters.
+// A gmail connector has no OAuth discovery, so it names Google's AuthURL,
+// TokenURL and RevokeURL itself.
 type ConnectorConfig struct {
+	Kind         string // "mcp" (default) or "gmail"
 	URL          string
+	AuthURL      string
+	TokenURL     string
+	RevokeURL    string
 	ClientID     string
 	ClientSecret string
 	Scopes       []string
 	AuthParams   map[string]string
+}
+
+// AuthConfig configures sign-in. GoogleClientIDs are the OAuth client ids
+// whose ID tokens are accepted (the iOS client id at least). Passkeys are
+// bound to WebAuthnRPID, a domain serving apple-app-site-association.
+type AuthConfig struct {
+	GoogleClientIDs []string
+	WebAuthnRPID    string
+	WebAuthnRPName  string
+	WebAuthnOrigins []string
+	SessionTTL      time.Duration
 }
 
 // APNSConfig is the APNs token-auth key. Push is off unless every field is set.
@@ -63,13 +86,30 @@ type APNSConfig struct {
 	Topic   string
 }
 
-// AgentConfig configures the model the agent loop talks to.
+// NtfyConfig is the ntfy server. Delivery is off unless URL, TopicPrefix and
+// TopicSecret (or TOKEN_ENCRYPTION_KEY) are set.
+type NtfyConfig struct {
+	URL         string
+	TopicPrefix string
+	TopicSecret string
+	Token       string
+}
+
+// AgentConfig configures the models the agent loop talks to (Fireworks).
 type AgentConfig struct {
-	AnthropicAPIKey  string
-	AnthropicBaseURL string
-	Model            string
+	// PublicHost is the host of PUBLIC_URL: the server must not fetch itself.
+	PublicHost       string
+	FireworksAPIKey  string
+	FireworksBaseURL string
+	QualityModel     string
+	SpeedModel       string
 	MaxTokens        int
 	MaxSteps         int
+	RoutineMaxSteps  int
+	ContextBudget    int
+	ModelTimeout     time.Duration
+	ModelMaxRetries  int
+	TavilyAPIKey     string
 }
 
 // WorkerConfig configures the background job worker.
@@ -86,21 +126,45 @@ func Load() *Config {
 	}
 
 	port := getEnv("PORT", "8787")
+	publicURL := strings.TrimRight(getEnv("PUBLIC_URL", "http://127.0.0.1:"+port), "/")
+	rpID := "localhost"
+	if u, err := url.Parse(publicURL); err == nil && u.Hostname() != "" {
+		rpID = u.Hostname()
+	}
+	tokenKey, err := secretbox.ParseKey(getEnv("TOKEN_ENCRYPTION_KEY", ""))
+	if err != nil {
+		log.Fatalf("config: %v", err)
+	}
 	return &Config{
+		TokenKey:     tokenKey,
 		Host:         getEnv("HOST", "127.0.0.1"),
 		Port:         port,
 		Environment:  getEnv("ENVIRONMENT", "development"),
-		PublicURL:    strings.TrimRight(getEnv("PUBLIC_URL", "http://127.0.0.1:"+port), "/"),
-		APIToken:     getEnv("API_TOKEN", ""),
+		PublicURL:    publicURL,
 		WorkspaceDir: getEnv("WORKSPACE_DIR", "data/workspaces"),
 		BodyLimit:    getEnvInt("BODY_LIMIT_BYTES", 20*1024*1024),
 
 		Agent: AgentConfig{
-			AnthropicAPIKey:  getEnv("ANTHROPIC_API_KEY", ""),
-			AnthropicBaseURL: getEnv("ANTHROPIC_BASE_URL", ""),
-			Model:            getEnv("AGENT_MODEL", "claude-opus-5-5"),
+			PublicHost:       rpID,
+			FireworksAPIKey:  getEnv("FIREWORKS_API_KEY", ""),
+			FireworksBaseURL: getEnv("FIREWORKS_BASE_URL", "https://api.fireworks.ai/inference/v1"),
+			QualityModel:     getEnv("AGENT_QUALITY_MODEL", "accounts/fireworks/models/glm-5p3-flash"),
+			SpeedModel:       getEnv("AGENT_SPEED_MODEL", "accounts/fireworks/models/deepseek-v4p1-flash"),
 			MaxTokens:        getEnvInt("AGENT_MAX_TOKENS", 16000),
 			MaxSteps:         getEnvInt("AGENT_MAX_STEPS", 100),
+			RoutineMaxSteps:  getEnvInt("ROUTINE_MAX_STEPS", 40),
+			ContextBudget:    getEnvInt("AGENT_CONTEXT_BUDGET", 300000),
+			ModelTimeout:     time.Duration(getEnvInt("AGENT_MODEL_TIMEOUT_SECONDS", 120)) * time.Second,
+			ModelMaxRetries:  getEnvInt("AGENT_MODEL_MAX_RETRIES", 2),
+			TavilyAPIKey:     getEnv("TAVILY_API_KEY", ""),
+		},
+
+		Auth: AuthConfig{
+			GoogleClientIDs: splitList(getEnv("GOOGLE_CLIENT_IDS", "")),
+			WebAuthnRPID:    getEnv("WEBAUTHN_RP_ID", rpID),
+			WebAuthnRPName:  getEnv("WEBAUTHN_RP_NAME", "Keen"),
+			WebAuthnOrigins: splitList(getEnv("WEBAUTHN_ORIGINS", publicURL)),
+			SessionTTL:      time.Duration(getEnvInt("SESSION_TTL_HOURS", 24*30)) * time.Hour,
 		},
 
 		Worker: WorkerConfig{
@@ -116,21 +180,26 @@ func Load() *Config {
 			Topic:   getEnv("APNS_TOPIC", ""),
 		},
 
+		Ntfy: NtfyConfig{
+			URL:         strings.TrimRight(getEnv("NTFY_URL", ""), "/"),
+			TopicPrefix: getEnv("NTFY_TOPIC", ""),
+			TopicSecret: getEnv("NTFY_TOPIC_SECRET", getEnv("TOKEN_ENCRYPTION_KEY", "")),
+			Token:       getEnv("NTFY_TOKEN", ""),
+		},
+
 		Connectors: map[string]ConnectorConfig{
 			"gmail": {
-				URL:          getEnv("GMAIL_MCP_URL", "https://gmailmcp.googleapis.com/mcp/v1"),
+				Kind:         "gmail",
+				URL:          getEnv("GMAIL_API_URL", "https://gmail.googleapis.com"),
+				AuthURL:      "https://accounts.google.com/o/oauth2/v2/auth",
+				TokenURL:     "https://oauth2.googleapis.com/token",
+				RevokeURL:    "https://oauth2.googleapis.com/revoke",
 				ClientID:     getEnv("GMAIL_CLIENT_ID", ""),
 				ClientSecret: getEnv("GMAIL_CLIENT_SECRET", ""),
 				Scopes: strings.Fields(getEnv("GMAIL_SCOPES",
-					"https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.compose")),
+					"https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/gmail.compose")),
 				// Google issues a refresh token only for offline access, and again only with consent.
 				AuthParams: map[string]string{"access_type": "offline", "prompt": "consent"},
-			},
-			"github": {
-				URL:          getEnv("GITHUB_MCP_URL", "https://api.githubcopilot.com/mcp/"),
-				ClientID:     getEnv("GITHUB_CLIENT_ID", ""),
-				ClientSecret: getEnv("GITHUB_CLIENT_SECRET", ""),
-				Scopes:       strings.Fields(getEnv("GITHUB_SCOPES", "repo read:org read:user user:email")),
 			},
 		},
 	}
@@ -149,6 +218,17 @@ func getEnv(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// splitList splits a comma separated value, dropping blanks.
+func splitList(v string) []string {
+	var out []string
+	for _, s := range strings.Split(v, ",") {
+		if s = strings.TrimSpace(s); s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 func getEnvInt(key string, def int) int {

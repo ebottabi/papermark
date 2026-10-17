@@ -9,6 +9,7 @@ package controllers
 
 import (
 	"papermark/internal/handlers"
+	"papermark/internal/middleware"
 	"papermark/internal/responses"
 	"papermark/internal/services"
 	"papermark/internal/utils"
@@ -46,7 +47,7 @@ func (c *DeviceController) Register(ctx *fiber.Ctx) error {
 	if req.Platform == "" {
 		req.Platform = "ios"
 	}
-	d, err := c.deviceService.Register(ctx.Context(), req.Token, req.Platform, req.Environment)
+	d, err := c.deviceService.Register(ctx.Context(), middleware.UserID(ctx), req.Token, req.Platform, req.Environment)
 	if err != nil {
 		return c.SendInternalError(ctx, "failed to register device")
 	}
@@ -55,7 +56,7 @@ func (c *DeviceController) Register(ctx *fiber.Ctx) error {
 
 // Unregister handles DELETE /v1/devices/:token.
 func (c *DeviceController) Unregister(ctx *fiber.Ctx) error {
-	if err := c.deviceService.Unregister(ctx.Context(), ctx.Params("token")); err != nil {
+	if err := c.deviceService.Unregister(ctx.Context(), middleware.UserID(ctx), ctx.Params("token")); err != nil {
 		return c.SendInternalError(ctx, "failed to remove device")
 	}
 	return c.SendSuccessWithMessage(ctx, nil, "device removed")

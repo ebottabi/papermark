@@ -5,11 +5,11 @@ The layout and conventions follow bee-saas. When in doubt, do what bee-saas does
 ## Tech Stack (STRICT)
 - **Go 1.26** for everything
 - **Fiber v2** for HTTP routing and middleware
-- **PostgreSQL** is the source of truth (tasks, events, model messages, jobs, projects, knowledge, skills)
+- **PostgreSQL** is the source of truth (users, sessions, tasks, events, model messages, jobs, projects, knowledge, skills)
 - **pgx / pgxpool** runs ALL runtime queries as raw SQL
 - **Redis** carries live task events between the worker and the HTTP servers
 - **GORM** for migrations ONLY (`AutoMigrate`). Never used to query/read/write data.
-- **anthropic-sdk-go** for the Messages API (streaming)
+- **Fireworks** `/chat/completions` (streaming) through `internal/integrations/fireworks`, no SDK
 
 ### Data access rule (NON-NEGOTIABLE)
 - GORM exists solely to migrate the schema (it reads the struct tags on the models).
@@ -25,8 +25,7 @@ The layout and conventions follow bee-saas. When in doubt, do what bee-saas does
 papermark/
 ├── cmd/
 │   ├── server/main.go           # HTTP API + in-process job worker; migrates on boot
-│   ├── worker/main.go           # Standalone job worker
-│   └── fakeanthropic/main.go    # Scripted Messages API stand-in (tests, demos)
+│   └── worker/main.go           # Standalone job worker
 ├── internal/
 │   ├── config/                  # Configuration loading
 │   ├── models/                  # Entity structs (GORM tags drive migration only)
@@ -35,18 +34,19 @@ papermark/
 │   ├── handlers/                # Shared handler scaffolding (envelope, Send*)
 │   ├── responses/               # Response DTOs (exact API.md shapes)
 │   ├── router/                  # Fiber app + route definitions
-│   ├── middleware/              # Bearer auth, logging, ratelimit
+│   ├── middleware/              # Session auth (user id in Locals), logging, ratelimit
+│   ├── harness/                 # Agent loop: harness.go (ChatTurn), turn.go, messages.go,
+│   │                            #   tools.go, web.go, connectors.go, events.go (task event log)
 │   ├── services/                # Business logic
 │   │   └── jobs/                # Durable job queue (outbox) + worker loop
 │   ├── workers/                 # Job handlers + the registry both binaries run
-│   ├── integrations/            # External APIs (anthropic, fakeanthropic)
+│   ├── integrations/            # External APIs (fireworks, mcp)
 │   ├── cache/                   # Redis access: cache-aside + live event bus
 │   ├── storage/                 # Local-disk storage + task workspaces
 │   ├── database/                # GORM migrator + pgx pool + Redis client + test databases
 │   └── utils/                   # Shared utilities
 ├── deploy/                      # systemd units + env example
 ├── docs/                        # Project documentation
-├── testdata/                    # fakeanthropic scripts
 └── go.mod
 ```
 
@@ -135,6 +135,8 @@ Files are lowercase with underscores, one primary type per file, tests in `<name
 
 ## Database Conventions
 
+- Per-user data: every resource row has `user_id`, and every query takes the user and filters by it.
+  Controllers pass `middleware.UserID(c)`; another user's row is `ErrNotFound` (404, never 403).
 - UUID ids (`gorm:"type:uuid"`), set in Go on insert along with `created_at`/`updated_at`.
 - Soft-deletable tables: every SELECT filters `deleted_at IS NULL`; delete with `UPDATE ... SET deleted_at`.
 - The GORM handle is opened only to run `AutoMigrate`, then closed.
@@ -143,7 +145,8 @@ Files are lowercase with underscores, one primary type per file, tests in `<name
 
 Tests run against real Postgres and Redis. `database.NewTestDatabase(t)` creates a migrated throwaway
 database and drops it on cleanup; `database.NewTestRedis(t)` connects to the shared Redis.
-Run `go test -race ./...`.
+Run `go test -race ./...`. No test calls Fireworks and there is no fake model: the loop's pure parts
+(stuck guard, trimming, argument parsing, fallback) are unit-tested and tasks run with an empty key.
 
 ## Prohibited Practices
 

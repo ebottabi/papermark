@@ -17,10 +17,9 @@ import (
 // TestDiscoverLive checks discovery against the real catalog servers. Run with MCP_LIVE=1.
 func TestDiscoverLive(t *testing.T) {
 	if os.Getenv("MCP_LIVE") == "" {
-		t.Skip("set MCP_LIVE=1 to reach the real GitHub and Gmail MCP servers")
+		t.Skip("set MCP_LIVE=1 to reach the real Gmail MCP server")
 	}
 	cases := []struct{ url, auth, token string }{
-		{"https://api.githubcopilot.com/mcp/", "https://github.com/login/oauth/authorize", "https://github.com/login/oauth/access_token"},
 		{"https://gmailmcp.googleapis.com/mcp/v1", "https://accounts.google.com/o/oauth2/v2/auth", "https://oauth2.googleapis.com/token"},
 	}
 	hc := &http.Client{Timeout: 30 * time.Second}

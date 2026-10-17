@@ -5,11 +5,13 @@
  * Written by Ebot Tabi <ebot.tabi@gmail.com>, 15/10/2026
  */
 
-package services
+package harness
 
 import (
 	"context"
 	"encoding/json"
+
+	"github.com/google/uuid"
 )
 
 // ToolOutput is what a tool call returns to the model.
@@ -36,15 +38,28 @@ type ConnectorToolset struct {
 	Tools         []ConnectorTool // sorted by name
 	Handlers      map[string]ConnectorHandler
 	NeedsApproval map[string]bool // every tool not annotated readOnlyHint
-	Close         func()
+	NoAlways      map[string]bool // tools whose approval cannot be remembered for the task
+	// Resolve rewrites a call's input before it is shown for approval or run,
+	// so the user approves exactly what executes (gmail fills in the account).
+	Resolve map[string]func(input json.RawMessage) (json.RawMessage, error)
+	Close   func()
 }
 
-// ConnectorProvider returns the connectors that are connected right now.
+type workspaceKey struct{}
+
+// WorkspaceFrom returns the task workspace directory a connector handler runs
+// in, or "" outside a task.
+func WorkspaceFrom(ctx context.Context) string {
+	dir, _ := ctx.Value(workspaceKey{}).(string)
+	return dir
+}
+
+// ConnectorProvider returns a user's connectors that are connected right now.
 type ConnectorProvider interface {
-	Snapshot(ctx context.Context) (*ConnectorToolset, error)
+	Snapshot(ctx context.Context, userID uuid.UUID) (*ConnectorToolset, error)
 }
 
-// Notifier delivers a notification (APNs) when a task needs the user or has
+// Notifier delivers a notification (APNs, ntfy) when a task needs the user or has
 // finished: eventType is ask, confirm, idle or error; text is the question,
 // the tool name to approve, the result or the error. It is called after the
 // event commits, on the run's goroutine; errors are logged.
@@ -54,7 +69,7 @@ type Notifier interface {
 
 type noConnectors struct{}
 
-func (noConnectors) Snapshot(context.Context) (*ConnectorToolset, error) {
+func (noConnectors) Snapshot(context.Context, uuid.UUID) (*ConnectorToolset, error) {
 	return &ConnectorToolset{}, nil
 }
 

@@ -13,6 +13,7 @@ import (
 	"papermark/internal/models"
 	"papermark/internal/models/queries"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -26,13 +27,13 @@ func NewDeviceService(pool *pgxpool.Pool) *DeviceService {
 	return &DeviceService{pool: pool}
 }
 
-// Register stores token, or updates its platform and environment (idempotent by token).
-func (s *DeviceService) Register(ctx context.Context, token, platform, environment string) (*models.Device, error) {
-	return queries.UpsertDevice(ctx, s.pool, token, platform, environment)
+// Register stores the user's token, or updates its platform and environment (idempotent by token).
+func (s *DeviceService) Register(ctx context.Context, user uuid.UUID, token, platform, environment string) (*models.Device, error) {
+	return queries.UpsertDevice(ctx, s.pool, user, token, platform, environment)
 }
 
 // Unregister removes token. Removing an unknown token is not an error.
-func (s *DeviceService) Unregister(ctx context.Context, token string) error {
-	_, err := queries.SoftDeleteDeviceByToken(ctx, s.pool, token)
+func (s *DeviceService) Unregister(ctx context.Context, user uuid.UUID, token string) error {
+	_, err := queries.SoftDeleteDeviceByToken(ctx, s.pool, user, token)
 	return err
 }

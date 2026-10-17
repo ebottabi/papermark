@@ -17,6 +17,7 @@ import (
 	"papermark/internal/models/queries"
 	"papermark/internal/notifications/apns"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -40,12 +41,16 @@ func NewPushService(pool *pgxpool.Pool, sender Sender) *PushService {
 	return &PushService{pool: pool, sender: sender}
 }
 
-// Send pushes text about taskID (event eventType) to every device.
+// Send pushes text about taskID (event eventType) to the task owner's devices.
 func (s *PushService) Send(ctx context.Context, taskID, eventType, text string) error {
 	if s.sender == nil {
 		return nil
 	}
-	devices, err := queries.ListDevices(ctx, s.pool)
+	id, err := uuid.Parse(taskID)
+	if err != nil {
+		return fmt.Errorf("push: task id: %w", err)
+	}
+	devices, err := queries.ListTaskOwnerDevices(ctx, s.pool, id)
 	if err != nil {
 		return fmt.Errorf("push: list devices: %w", err)
 	}
@@ -57,7 +62,7 @@ func (s *PushService) Send(ctx context.Context, taskID, eventType, text string) 
 		case err == nil:
 		case apns.IsUnregistered(err):
 			log.Printf("push: pruning device id=%s: %v", d.ID, err)
-			if _, derr := queries.SoftDeleteDeviceByToken(ctx, s.pool, d.Token); derr != nil {
+			if _, derr := queries.SoftDeleteDeviceByToken(ctx, s.pool, d.UserID, d.Token); derr != nil {
 				errs = append(errs, derr)
 			}
 		default:

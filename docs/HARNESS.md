@@ -1,6 +1,6 @@
 # Papermark agent harness on Fireworks (GLM 5.3 Flash + DeepSeek V4.1 Flash): design proposal
 
-Status: proposal only, no code written. Paths are relative to /Users/ebot/papermark unless they start with `plane:` (= /Users/ebot/soc/plane/internal/harness).
+Status: built in `internal/harness`. Paths are relative to /Users/ebot/papermark unless they start with `plane:` (= /Users/ebot/soc/plane/internal/harness).
 
 ## 0. The one-paragraph version
 
@@ -26,16 +26,16 @@ The whole system. One queue, any worker takes any job, no master.
                  └────────────┬─────────────┘            │
                               ▼ claim                    │
 ┌──────────── cmd/worker (or in-process in cmd/server) ──┴─────────┐
-│ jobs.Worker ── registry ─┬─ task.run   ─► agent loop (below)     │
+│ jobs.Worker ── registry ─┬─ chat.turn   ─► agent loop (below)     │
 │                          ├─ push.send  ─► APNs                   │
 │                          └─ email.send ─► mail provider (later)  │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-One `task.run` job is one run of the loop:
+One `chat.turn` job is one run of the loop:
 
 ```
-            claim task.run (key = task id)
+            claim chat.turn (key = task id)
                         │
                         ▼
               ┌──────────────────┐
@@ -55,7 +55,7 @@ One `task.run` job is one run of the loop:
              ▼                    ▼                              │
         ┌─────────┐     run each call in order                   │
         │  idle   │     (shell, files, web_fetch, web_search,    │
-        │ done ✓  │      Gmail/GitHub MCP), store each result    │
+        │ done ✓  │      Gmail MCP), store each result           │
         └─────────┘               │                              │
                                   ▼                              │
                     ask/confirm? ── yes ──► park: save pending,  │
@@ -74,6 +74,70 @@ One `task.run` job is one run of the loop:
                   result become "Not run: the task was interrupted."
 ```
 
+## Durability: async, recoverable, resumable
+
+The harness is fully async. It recovers from crashes. The user can leave the app and come back. Every step is stored before the next one starts.
+
+```
+ POST /v1/tasks ─► queued (chat.turn job, key = task id)
+                        │ claim
+                        ▼
+                     running ──── worker crash ───► lease expires (30s)
+                        │  ▲                              │
+                        │  └──── reclaim, resume from ────┘
+                        │        stored messages
+         ask / confirm  │
+         ┌──────────────┤
+         ▼              │
+      waiting           ├──► done     (idle, or an answer with no tool call)
+   (no job held)        ├──► stopped  (/stop)
+         │              └──► error    (failure, stuck, no key)
+         │ /reply, /confirm
+         └──► queued again ─► running
+```
+
+### Fully async
+
+- An HTTP call only records the user's input and enqueues a `chat.turn` job, in one transaction. Then it returns. See `services/task.go:start`, `answer` and `Message`.
+- `Notify()` runs after commit. It wakes an in-process worker. Workers in other processes pick the job up on their next poll. See `services/jobs/service.go:Notify`.
+- The model and the tools run only on a worker. That is either the in-process worker in cmd/server or cmd/worker. Both run the same registry. See `cmd/server/main.go` and `cmd/worker/main.go` (`jobs.NewWorker` with `workers.NewRegistry`).
+- The app watches over SSE. Live frames come from Redis. History comes from Postgres by event seq. See `controllers/task.go:Events`.
+- The phone gets a push for ask, confirm, idle and error. See `harness/events.go:notified`.
+
+### The user can leave and come back
+
+- Closing the app does not touch the run. The job runs on the worker, not in the HTTP request.
+- On return the app reconnects with `Last-Event-ID` (or `?from`). The server subscribes to Redis first, then replays every event after that seq from Postgres, then streams live frames. If a live frame skips a seq it refills from Postgres. See `controllers/task.go:Events`.
+- A task waiting on ask or confirm holds no job and no worker slot. `park` saves the pending action and the job ends. See `harness/turn.go:park`.
+- `/reply` and `/confirm` store the answer on the pending action and enqueue the next turn. See `services/task.go:answer`.
+
+### Durable
+
+- Each event is appended to Postgres inside the transaction that holds the task's row lock. It goes to Redis and push only after commit. See `harness/events.go:tx`.
+- Each model message and its token usage commit in one transaction before any of its tool calls run. See `harness/turn.go:run` and `store`.
+- Each tool result commits as it lands, before the next call starts. See `harness/turn.go:record`.
+- The job key is the task id. A task has at most one active turn. Enqueueing an active key only flags the running job to run once more. See `harness/harness.go:TurnJob` and `queries/job.go` (`enqueueJob`, `CompleteJob`).
+- A worker renews its lease every third of the lease (default 30s). A running job whose lease expired is claimed again by any worker. See `services/jobs/worker.go:run` and `queries/job.go:claimJobs`.
+- A worker that shuts down cleanly releases its jobs back to pending. See `services/jobs/worker.go:run` (`ReleaseJob`).
+- A failed job retries with backoff, 5s doubling up to 1h. Attempts count claims. After `max_attempts` (default 10) the job is dead. See `services/jobs/service.go:Backoff` and `queries/job.go:FailJob`.
+
+### Recovery
+
+- A turn rebuilds everything from Postgres. Nothing lives only in worker memory. See `harness/harness.go:ChatTurn` and `harness/turn.go:run`.
+- If the last stored message is an assistant message, the turn continues its tool calls. Results already stored in `partial_results` are kept and skipped. See `harness/turn.go:runTools`.
+- A call that has no stored result after a crash is recorded as "Not run: the task was interrupted." It is never run twice. See `harness/turn.go:runTools`.
+- An approval is consumed before its call starts. A worker that dies mid-call leaves that call interrupted instead of running it again. See `harness/turn.go:runTools`.
+- A stop is seen either on the Redis bus or in the task row. The turn subscribes first, then reads the row, so neither path misses it. See `harness/harness.go:ChatTurn` and `services/task.go:Stop`.
+- A stopped run still records the result of the call it killed. See `harness/turn.go:record`.
+- A message sent while the task runs goes to the inbox. It is delivered as the next user message after the current step's tool results. A message sent after the task finished starts a new turn. See `services/task.go:Message` and `harness/turn.go:finish` and `deliverInbox`.
+
+### Limits
+
+- A model call cut off mid-stream is not stored. The retry starts that step again. The text already streamed to the app is not kept. See `harness/turn.go:run` (store runs only after `call` returns).
+- A shell command killed by a crash is not resumed. It is reported as interrupted.
+- A deploy rollback swaps the binaries back. It does not undo migrations. See `deploy/deploy.sh:rollback`.
+- Push is still sent inline after commit. A push that fails is logged and not retried. The `push.send` outbox job is not built yet. See `harness/events.go:tx`.
+
 ## 1. Provider facts (Fireworks, as verified from official pages)
 
 Everything below was read from Fireworks pages (fireworks.ai/models, docs.fireworks.ai guides). Items I could not confirm are marked UNVERIFIED.
@@ -87,7 +151,7 @@ Everything below was read from Fireworks pages (fireworks.ai/models, docs.firewo
 | Default `max_tokens` | **2048** if omitted, and it is lowered silently to fit the context. We must always send `max_tokens`. plane does this at `plane:middleware/router.go:72`. |
 | Tool format | OpenAI `tools:[{type:"function",function:{name,description,parameters}}]`. Tool result is `role:"tool"` with `tool_call_id`. |
 | Streaming tool calls | `delta.tool_calls[]` fragments grouped by `index`: keep `id` and `name` when they appear, append `arguments`, finish with `finish_reason:"tool_calls"`. |
-| `tool_choice` | `auto`, `none`, `required` or a named function are documented for Fireworks in general. Per-model support is UNVERIFIED. **We send none of it.** The loop treats "no tool call" as "done", as it does today (`idleResult`, `agent.go`). |
+| `tool_choice` | `auto`, `none`, `required` or a named function are documented for Fireworks in general. Per-model support is UNVERIFIED. **We send none of it.** The loop treats "no tool call" as "done", as it does today (`idleResult`, `turn.go`). |
 | Parallel tool calls | Fireworks says "some models" can; there is no `parallel_tool_calls` parameter. Per-model behaviour UNVERIFIED. We handle N calls per turn and send no flag. |
 | Reasoning | Reasoning comes back in `delta.reasoning_content`, or as `<think>` in `content` for some models. For models with interleaved thinking, `reasoning_content` from earlier assistant turns **must be sent back** during multi-turn tool use. `reasoning_effort` accepts `low`/`medium`/`high` (docs); whether GLM 5.3 Flash and DeepSeek V4.1 honour it on Fireworks is UNVERIFIED. |
 | Usage in stream | `stream_options.include_usage` is used by plane (`plane:runtime/fireworks.go:15-19` says it is supported). Cached-token field name on Fireworks is read by plane's `usage.go`; confirm with one live call. |
@@ -101,7 +165,7 @@ plane has a full harness in `plane:`. Ideas we take, each with its source:
 | Idea | Source | What we do |
 |---|---|---|
 | Loop shape: call model, store assistant row, run tools, store results, repeat until a turn has no tool call | `plane:engine/loop.go:96-175` | Same as our current loop. Keep it. |
-| Resume after a crash: re-run only the calls of the last tool step that have no stored result | `plane:engine/loop.go:89-95`, `:316-341` (`pendingCalls`) | We already do this with `PartialResults` (`agent.go afterAssistant`). Keep ours. |
+| Resume after a crash: re-run only the calls of the last tool step that have no stored result | `plane:engine/loop.go:89-95`, `:316-341` (`pendingCalls`) | We already do this with `PartialResults` (`turn.go runTools`). Keep ours. |
 | One streaming client for Fireworks `/chat/completions`, SSE parse until `[DONE]`, tool-call fragments merged by index, bounded index | `plane:runtime/chat.go:132-207`, `maxToolCalls` at `:34` | **Copy** as `internal/integrations/fireworks/client.go`. |
 | Retry with backoff + jitter, honour `Retry-After`, give up if it asks for more than 60 s, **retry only while nothing has been streamed** so a delta is never sent twice | `plane:runtime/chat.go:61-104` | Copy. |
 | Error classes (rate_limited, unavailable, timeout, auth, bad_request, bad_response); provider bodies never logged | `plane:runtime/runtime.go:78-111`, `chat.go:222-235` | Copy. |
@@ -130,12 +194,12 @@ plane has a full harness in `plane:`. Ideas we take, each with its source:
 
 ## 3. Where it lives
 
-- Everything runs inside the existing job loop. `cmd/worker` builds `services.New` and `jobs.NewWorker(... workers.NewRegistry(svcs))` already (`cmd/worker/main.go:46-51`). The agent is the `task.run` handler. **No orchestrator, no sub-agents, no new binary.**
-- Unit of work: one claimed `task.run` job = one **run** (not one model step). A run loops (model call, tools, model call, ...) until the task finishes, parks on ask/confirm, is stopped, or the worker shuts down. This is how it works today (`agent.go Run/loop`). The job key is the task id, so a task has at most one active run (`agent.go:RunTaskJob`).
+- Everything runs inside the existing job loop. `cmd/worker` builds `services.New` and `jobs.NewWorker(... workers.NewRegistry(svcs))` already (`cmd/worker/main.go:46-51`). The agent is the `chat.turn` handler. **No orchestrator, no sub-agents, no new binary.**
+- Unit of work: one claimed `chat.turn` job = one **run** (not one model step). A run loops (model call, tools, model call, ...) until the task finishes, parks on ask/confirm, is stopped, or the worker shuts down. This is how it works today (`harness.go ChatTurn`, `turn.go run`). The job key is the task id, so a task has at most one active run (`harness.go:TurnJob`).
 - `cmd/server` **keeps** running the worker in-process (`cmd/server/main.go:88-101`). That keeps one-binary dev and small deployments working, and both binaries share the SKIP LOCKED queue so running both is safe. For production with a separate worker fleet, add one optional env `WORKER_INLINE=false` that makes the server skip starting the worker (about 3 lines). Not needed on day one.
 - Shared workspace requirement stays: server and workers must see the same `WORKSPACE_DIR`.
 
-## 4. The loop (what changes in `internal/services/agent*.go`)
+## 4. The loop (what changes in `internal/harness`)
 
 Most of `agent.go` stays. The changes are mechanical.
 
@@ -146,7 +210,7 @@ Most of `agent.go` stays. The changes are mechanical.
 
 The assistant message is stored as the client returned it, with `reasoning_content` included, and it is replayed byte-identical (this keeps Fireworks' prompt cache warm, as the current code does for Anthropic).
 
-**Tool schema.** One function builds the list: built-ins plus MCP tools, each wrapped as `{"type":"function","function":{"name","description","parameters"}}`. MCP `InputSchema` is already JSON Schema (`agent_tools.go ConnectorTool`), so conversion is a wrapper, nothing more. The built-in schemas in `agent_tools.go` change `input_schema` to `parameters`. Fireworks accepts the same JSON Schema subset as structured outputs; only in-document `#/` refs resolve. A connector tool with an external `$ref` would 400 the whole request, so strip or skip such a tool (log it) instead of failing the run. This is a risk to test with real Gmail/GitHub schemas.
+**Tool schema.** One function builds the list: built-ins plus MCP tools, each wrapped as `{"type":"function","function":{"name","description","parameters"}}`. MCP `InputSchema` is already JSON Schema (`tools.go ConnectorTool`), so conversion is a wrapper, nothing more. The built-in schemas in `tools.go` change `input_schema` to `parameters`. Fireworks accepts the same JSON Schema subset as structured outputs; only in-document `#/` refs resolve. A connector tool with an external `$ref` would 400 the whole request, so strip or skip such a tool (log it) instead of failing the run. This is a risk to test with real Gmail schemas.
 
 **Parallel tool calls.** The model may return several calls in one turn. We run them one after another in order, which is what `afterAssistant` does now, and write one `tool` message per call. `PartialResults` holds those tool messages. `finish()` then appends them, followed by one `user` message if the inbox had queued text. (OpenAI shape wants every `tool_calls` id answered before the next assistant turn, and `finish()` already guarantees that.)
 
@@ -183,10 +247,12 @@ The assistant message is stored as the client returned it, with `reasoning_conte
 
 | Mode | Primary | Fallback | Effort |
 |---|---|---|---|
-| `speed` | DeepSeek V4.1 Flash | GLM 5.3 Flash | `low` |
-| `quality` | GLM 5.3 Flash | DeepSeek V4.1 Flash | provider default |
+| `speed` | GLM 5.3 Flash | DeepSeek V4.1 Flash | `low` |
+| `quality` | GLM 5.3 Flash | DeepSeek V4.1 Flash | `medium` |
 
-Fallback rule: a retryable failure (429/5xx/timeout, after the client's own retries) **before any text was streamed** moves the call to the other model (`plane:middleware/router.go:88`). The model is derived from the task's mode on every run, so there is no stored pin and no migration.
+GLM 5.3 Flash runs every turn; mode only sets the reasoning effort. Omitting the effort lets GLM think at its maximum, which held the first event back about 19 s in production.
+
+Fallback rule: a retryable failure (429/5xx/timeout, after the client's own retries) **before any text was streamed** moves the call to the fallback model (`plane:middleware/router.go:88`). The model is derived from the task's mode on every run, so there is no stored pin and no migration.
 
 Risk with fallback mid-task: the stored `reasoning_content` of one model is replayed to the other. Fireworks says unneeded reasoning is ignored by models without interleaved thinking, but cross-model replay is UNVERIFIED. The live test (section 8) must cover it; if it misbehaves, drop the reasoning from earlier turns when the model changes.
 
@@ -207,7 +273,7 @@ TAVILY_API_KEY=                                      # web_search
 
 ## 6. web_search and web_fetch
 
-Today these are Anthropic server tools (`agent_tools.go`: `web_search_20260318`, `web_fetch_20260318`; `serverToolEvents`; `pause_turn`). Neither GLM 5.3 Flash nor DeepSeek on Fireworks has server tools, so both become normal client tools in `internal/services/agent_web.go`, copied from plane:
+Today these are Anthropic server tools (`tools.go`: `web_search_20260318`, `web_fetch_20260318`; `serverToolEvents`; `pause_turn`). Neither GLM 5.3 Flash nor DeepSeek on Fireworks has server tools, so both become normal client tools in `internal/harness/web.go`, copied from plane:
 - `web_fetch(url)`: SSRF-guarded client, manual redirects with the address check on every hop, HTML to text, 50k cap. (`plane:tools/web_fetch.go`, `addr_guard.go`.)
 - `web_search(query, maxResults)`: Tavily, titles/links/snippets only. (`plane:tools/web_search.go`.) Needs `TAVILY_API_KEY`. Without it the tool is not offered.
 - They are not approval-gated (read-only) and flow through the normal `execute -> record -> toolEvent` path, so the `tool` event for them keeps the same shape API.md describes (name, input, short text output). **Deleted:** `serverToolEvents`, the `pause_turn` branch, the `refusal` branch.
@@ -219,8 +285,8 @@ Same queue, same registry. A job kind is one file in `internal/workers/` impleme
 
 | Job type | Payload | Status |
 |---|---|---|
-| `task.run` | `{taskId}` | exists |
-| `push.send` | `{taskId, type, text}` | **new, build now.** Today `events.tx` calls `Notifier.Send` inline on the run goroutine after commit (`task_events.go:140-145`), so a slow APNs call stalls the agent and a crash drops the push. Instead enqueue `push.send` in the same transaction as the event (outbox, `jobs.Enqueue(ctx, tx, ...)`). Job key `taskId:seq` makes a retried emit a no-op while the push is still pending. A duplicate push after a crash between send and complete is acceptable. |
+| `chat.turn` | `{taskId}` | exists |
+| `push.send` | `{taskId, type, text}` | **new, build now.** Today `events.tx` calls `Notifier.Send` inline on the run goroutine after commit (`events.go:140-145`), so a slow APNs call stalls the agent and a crash drops the push. Instead enqueue `push.send` in the same transaction as the event (outbox, `jobs.Enqueue(ctx, tx, ...)`). Job key `taskId:seq` makes a retried emit a no-op while the push is still pending. A duplicate push after a crash between send and complete is acceptable. |
 | `email.send` | `{to, subject, text}` | **new, add with the first feature that sends mail.** I found no email code or requirement in papermark. Proposed provider: Resend (plane's AGENTS.md lists Resend for transactional email; I did not check its client code). About 60 lines in `internal/integrations/resend`. Open question 5. |
 | schedules | | stays as the 15 s ticker `workers.RunScheduler`; it already enqueues task runs. Not a job kind. |
 
@@ -231,26 +297,57 @@ Capacity note: one agent run holds one of the `WORKER_CONCURRENCY` slots (defaul
 **Add**
 - `internal/integrations/fireworks/client.go` (copy and trim `plane:runtime/chat.go`, `runtime.go` error types, `estimate.go`; about 350 lines). Note `plane:` uses its own logger package; swap for `log.Printf`.
 - `internal/integrations/fireworks/client_test.go` (copy relevant cases from `plane:runtime/chat_test.go`).
-- `internal/services/agent_web.go` (web_fetch + web_search, copied; about 300 lines with the address guard).
+- `internal/harness/web.go` (web_fetch + web_search, copied; about 300 lines with the address guard).
 - `internal/workers/push.go` (handler `push.send`); later `internal/workers/email.go`.
-- `internal/integrations/fakefireworks/fake.go` and `cmd/fakefireworks/main.go` (replaces `fakeanthropic`; see 9).
-- `testdata/lisbon.json` rewritten for the new fake's script format (or kept if the script format is kept; see 9).
 
 **Change**
-- `internal/services/agent.go`: model call, message shapes, `deltas`, `finish`, wrap-up step, stuck guard, model chain by mode. Drop `pause_turn`/`refusal`.
-- `internal/services/agent_tools.go`: `input_schema` to `parameters` wrapper, delete server-tool entries and `serverToolEvents`.
-- `internal/services/task_events.go`: replace the inline `Notifier.Send` with a `push.send` enqueue inside the tx (`notified` map stays).
+- `internal/harness/turn.go`: model call, message shapes, `deltas`, `finish`, wrap-up step, stuck guard, model chain by mode. Drop `pause_turn`/`refusal`.
+- `internal/harness/tools.go`: `input_schema` to `parameters` wrapper, delete server-tool entries and `serverToolEvents`.
+- `internal/harness/events.go`: replace the inline `Notifier.Send` with a `push.send` enqueue inside the tx (`notified` map stays).
 - `internal/services/services.go`: build the Fireworks client.
 - `internal/config/config.go`: the env vars in 5.
 - `internal/workers/registry.go`: register `push.send`.
 - `internal/models/task.go`: comment on `TaskMessage` (no schema change).
 - `.env.example`, `deploy/papermark.env.example`, `docs/ARCHITECTURE.md`, `docs/CLAUDE.md` (stack line "anthropic-sdk-go" and project tree), `API.md` (the sentence saying web tools are Anthropic server tools and `mode` text "effort low/high").
 - `go.mod`/`go.sum`: remove `anthropic-sdk-go` (`go mod tidy`).
-- `internal/services/agent_test.go` (535 lines): port to the new fake.
+- `internal/harness/harness_test.go`: unit tests for the pure parts; no model calls.
 
 **Delete**
 - `internal/integrations/anthropic/`
-- `internal/integrations/fakeanthropic/` and `cmd/fakeanthropic/` (the working tree already shows `cmd/fakeanthropic/main.go` deleted and uncommitted; `.gitignore` is also modified. Worth checking these before building.)
+- `internal/integrations/fakeanthropic/`, `cmd/fakeanthropic/` and `testdata/`.
+- The router tests that drove scripted model turns (SSE run, restart while waiting, kill mid-tool, queued messages, fork, files, stop).
+
+**Data model:** no new tables or columns. `task_messages.message` holds a different JSON shape (see open question 1 for old rows).
+
+**Test plan** (decided: no fake model, no calls to Fireworks from any test)
+1. Unit tests for the pure parts: stuck guard, request trimming, tool-argument parsing, fallback classification, external `$ref` detection, partial-string preview.
+2. Tasks run with an empty key and must end in an error naming `FIREWORKS_API_KEY`; the router suite exercises the API this way.
+3. The client's wire behavior (reasoning replay, cached-token field, `reasoning_effort`) is verified by hand on a staging task, not by a test.
+
+## 8. Files
+
+**Add**
+- `internal/integrations/fireworks/client.go` (copy and trim `plane:runtime/chat.go`, `runtime.go` error types, `estimate.go`; about 350 lines). Note `plane:` uses its own logger package; swap for `log.Printf`.
+- `internal/integrations/fireworks/client_test.go` (copy relevant cases from `plane:runtime/chat_test.go`).
+- `internal/harness/web.go` (web_fetch + web_search, copied; about 300 lines with the address guard).
+- `internal/workers/push.go` (handler `push.send`); later `internal/workers/email.go`.
+
+**Change**
+- `internal/harness/turn.go`: model call, message shapes, `deltas`, `finish`, wrap-up step, stuck guard, model chain by mode. Drop `pause_turn`/`refusal`.
+- `internal/harness/tools.go`: `input_schema` to `parameters` wrapper, delete server-tool entries and `serverToolEvents`.
+- `internal/harness/events.go`: replace the inline `Notifier.Send` with a `push.send` enqueue inside the tx (`notified` map stays).
+- `internal/services/services.go`: build the Fireworks client.
+- `internal/config/config.go`: the env vars in 5.
+- `internal/workers/registry.go`: register `push.send`.
+- `internal/models/task.go`: comment on `TaskMessage` (no schema change).
+- `.env.example`, `deploy/papermark.env.example`, `docs/ARCHITECTURE.md`, `docs/CLAUDE.md` (stack line "anthropic-sdk-go" and project tree), `API.md` (the sentence saying web tools are Anthropic server tools and `mode` text "effort low/high").
+- `go.mod`/`go.sum`: remove `anthropic-sdk-go` (`go mod tidy`).
+- `internal/harness/harness_test.go`: unit tests for the pure parts; no model calls.
+
+**Delete**
+- `internal/integrations/anthropic/`
+- `internal/integrations/fakeanthropic/`, `cmd/fakeanthropic/` and `testdata/`.
+- The router tests that drove scripted model turns (SSE run, restart while waiting, kill mid-tool, queued messages, fork, files, stop).
 
 **Data model:** no new tables or columns. `task_messages.message` holds a different JSON shape (see open question 1 for old rows).
 
@@ -260,7 +357,7 @@ Capacity note: one agent run holds one of the `WORKER_CONCURRENCY` slots (defaul
 3. Agent tests (port existing): plain finish, parallel calls, ask and reply, confirm approve and deny, `always`, queued message while running, stop mid-call, kill and resume (calls without results become "interrupted"), wrap-up at max steps, stuck guard, trimming only touches the request copy, usage columns, delta frames for notify/ask/idle.
 4. Push job: event commit creates the job; a retry does not double-enqueue.
 5. One build-tagged **live** test against Fireworks with a real key (plane has the same: `plane:runtime/live_test.go:21`): one call with one tool on each model, asserts a tool call and non-zero usage. Also run one real two-turn tool conversation to settle the UNVERIFIED items: reasoning replay, cached-token field, `reasoning_effort`, cross-model replay.
-6. Real Gmail/GitHub MCP tool schemas run through the Fireworks tool validator once (the `$ref` risk).
+6. Real Gmail MCP tool schemas run through the Fireworks tool validator once (the `$ref` risk).
 
 ## 9. Risks
 
@@ -274,7 +371,7 @@ Capacity note: one agent run holds one of the `WORKER_CONCURRENCY` slots (defaul
 
 1. **Existing tasks.** Their stored messages are Anthropic-shaped and cannot be replayed to Fireworks. Options: (a) wipe tasks (fine if nothing is live; simplest, my default), (b) mark old tasks read-only (events stay readable; `/messages` and `/fork` on them return 409), (c) write a converter (about 80 lines, I would not). Which?
 2. **Is `speed` = DeepSeek V4.1 Flash and `quality` = GLM 5.3 Flash what you want?** Or one model for everything with the other only as fallback? Only the two Flash models are in use; full GLM 5.3 is out.
-3. **Test style.** plane forbids a fake model and calls real Fireworks in tests (`plane:docs/harness/BUILD-TODO.md:29`). I propose a fake for CI plus a live test, since papermark already has `fakeanthropic` and uses it in demos. Agree?
+3. **Test style. Decided:** no fake model and no test calls Fireworks, locally or in CI.
 4. **Search backend.** Tavily as in plane, or something else?
 5. **Email.** What sends mail (task finished? daily digest? sign-in?), and is Resend acceptable? Until answered I would only ship `push.send`.
 6. **Run the worker in `cmd/server`?** I propose yes, plus the optional `WORKER_INLINE=false` switch.

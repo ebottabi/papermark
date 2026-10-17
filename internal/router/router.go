@@ -27,12 +27,12 @@ import (
 )
 
 // Config carries what the HTTP layer needs: infrastructure for /ready, the
-// bearer token, and one controller per resource. A nil controller leaves its
-// routes unregistered.
+// session lookup, and one controller per resource. A nil controller leaves
+// its routes unregistered.
 type Config struct {
-	APIToken  string
-	BodyLimit int
-	Quiet     bool // skip the request logger (tests)
+	Authenticate middleware.Authenticate
+	BodyLimit    int
+	Quiet        bool // skip the request logger (tests)
 
 	Pool  *pgxpool.Pool
 	Redis *redis.Client // nil when Redis is not configured
@@ -44,6 +44,10 @@ type Config struct {
 	Devices    *controllers.DeviceController
 	Schedules  *controllers.ScheduleController
 	Connectors *controllers.ConnectorController
+	Auth       *controllers.AuthController
+	Prefs      *controllers.PreferencesController
+	Updates    *controllers.UpdateController
+	Memories   *controllers.MemoryController
 }
 
 // New builds the Fiber app: error envelope, recover, logger, CORS, /health,
@@ -124,9 +128,10 @@ func Setup(app *fiber.App, cfg *Config) {
 	api := app.Group("/v1")
 
 	setupOAuthCallbackRoute(api, cfg)
+	setupPublicAuthRoutes(api, cfg)
 
 	protected := api.Group("")
-	protected.Use(middleware.AuthMiddleware(cfg.APIToken))
+	protected.Use(middleware.AuthMiddleware(cfg.Authenticate))
 
 	protected.Get("/status", func(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{"success": true, "data": fiber.Map{
@@ -139,6 +144,59 @@ func Setup(app *fiber.App, cfg *Config) {
 	setupDeviceRoutes(protected, cfg)
 	setupScheduleRoutes(protected, cfg)
 	setupConnectorRoutes(protected, cfg)
+	setupAuthRoutes(protected, cfg)
+	setupAssistantRoutes(protected, cfg)
+}
+
+func setupAssistantRoutes(r fiber.Router, cfg *Config) {
+	if h := cfg.Prefs; h != nil {
+		r.Get("/me/preferences", h.Get)
+		r.Patch("/me/preferences", h.Patch)
+	}
+	if h := cfg.Updates; h != nil {
+		r.Get("/updates", h.List)
+		r.Post("/updates/read-all", h.ReadAll)
+		r.Post("/updates/:id/read", h.Read)
+	}
+	if h := cfg.Memories; h != nil {
+		r.Get("/memories", h.List)
+		r.Post("/memories", h.Create)
+		r.Patch("/memories/:id", h.Update)
+		r.Delete("/memories/:id", h.Delete)
+	}
+}
+
+// setupPublicAuthRoutes registers the sign-in endpoints. They sit outside
+// session auth, so they are rate limited per IP.
+func setupPublicAuthRoutes(api fiber.Router, cfg *Config) {
+	h := cfg.Auth
+	if h == nil {
+		return
+	}
+	limit := middleware.RateLimit(20, time.Minute)
+	api.Post("/auth/google", limit, h.Google)
+	api.Post("/auth/passkeys/login/begin", limit, h.PasskeyLoginBegin)
+	api.Post("/auth/passkeys/login/finish", limit, h.PasskeyLoginFinish)
+	api.Post("/auth/faceid/challenge", limit, h.FaceIDChallenge)
+	api.Post("/auth/faceid/login", limit, h.FaceIDLogin)
+}
+
+func setupAuthRoutes(r fiber.Router, cfg *Config) {
+	h := cfg.Auth
+	if h == nil {
+		return
+	}
+	limit := middleware.RateLimit(30, time.Minute)
+	r.Get("/me", h.Me)
+	r.Get("/auth/methods", h.Methods)
+	r.Post("/auth/logout", h.Logout)
+	r.Post("/auth/passkeys/register/begin", limit, h.PasskeyRegisterBegin)
+	r.Post("/auth/passkeys/register/finish", limit, h.PasskeyRegisterFinish)
+	r.Get("/auth/passkeys", h.Passkeys)
+	r.Delete("/auth/passkeys/:id", h.DeletePasskey)
+	r.Post("/auth/faceid/register", limit, h.FaceIDRegister)
+	r.Get("/auth/faceid", h.FaceIDKeys)
+	r.Delete("/auth/faceid/:id", h.RevokeFaceIDKey)
 }
 
 func setupTaskRoutes(r fiber.Router, h *controllers.TaskController) {

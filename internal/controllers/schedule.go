@@ -11,6 +11,7 @@ import (
 	"errors"
 
 	"papermark/internal/handlers"
+	"papermark/internal/middleware"
 	"papermark/internal/models"
 	"papermark/internal/models/queries"
 	"papermark/internal/responses"
@@ -34,6 +35,8 @@ func NewScheduleController(ss *services.ScheduleService) *ScheduleController {
 // ScheduleRequest is the body of POST and PATCH /v1/schedules. Absent fields
 // keep their value on PATCH; projectId and weekday accept null to clear.
 type ScheduleRequest struct {
+	Title     *string         `json:"title"`
+	Kind      *string         `json:"kind"`
 	Prompt    *string         `json:"prompt"`
 	Mode      *string         `json:"mode"`
 	ProjectID json.RawMessage `json:"projectId"`
@@ -45,6 +48,12 @@ type ScheduleRequest struct {
 
 // merge applies the fields present in r onto f.
 func (r ScheduleRequest) merge(f services.ScheduleFields) (services.ScheduleFields, error) {
+	if r.Title != nil {
+		f.Title = *r.Title
+	}
+	if r.Kind != nil {
+		f.Kind = *r.Kind
+	}
 	if r.Prompt != nil {
 		f.Prompt = *r.Prompt
 	}
@@ -78,13 +87,13 @@ func (r ScheduleRequest) merge(f services.ScheduleFields) (services.ScheduleFiel
 }
 
 func fieldsOf(s *models.Schedule) services.ScheduleFields {
-	return services.ScheduleFields{Prompt: s.Prompt, Mode: s.Mode, ProjectID: s.ProjectID, Repeat: s.Repeat,
+	return services.ScheduleFields{Title: s.Title, Kind: s.Kind, Prompt: s.Prompt, Mode: s.Mode, ProjectID: s.ProjectID, Repeat: s.Repeat,
 		Time: s.TimeOfDay, Weekday: s.Weekday, Enabled: s.Enabled}
 }
 
 // List handles GET /v1/schedules.
 func (c *ScheduleController) List(ctx *fiber.Ctx) error {
-	ss, err := c.scheduleService.List(ctx.Context())
+	ss, err := c.scheduleService.List(ctx.Context(), middleware.UserID(ctx))
 	if err != nil {
 		return c.SendInternalError(ctx, "failed to list schedules")
 	}
@@ -101,7 +110,7 @@ func (c *ScheduleController) Create(ctx *fiber.Ctx) error {
 	if err != nil {
 		return c.SendBadRequest(ctx, err.Error())
 	}
-	s, err := c.scheduleService.Create(ctx.Context(), f)
+	s, err := c.scheduleService.Create(ctx.Context(), middleware.UserID(ctx), f)
 	if err != nil {
 		return c.sendErr(ctx, err)
 	}
@@ -118,7 +127,7 @@ func (c *ScheduleController) Update(ctx *fiber.Ctx) error {
 	if err := ctx.BodyParser(&req); err != nil {
 		return c.SendBadRequest(ctx, "invalid request body")
 	}
-	cur, err := c.scheduleService.Get(ctx.Context(), id)
+	cur, err := c.scheduleService.Get(ctx.Context(), middleware.UserID(ctx), id)
 	if err != nil {
 		return c.sendErr(ctx, err)
 	}
@@ -126,7 +135,7 @@ func (c *ScheduleController) Update(ctx *fiber.Ctx) error {
 	if err != nil {
 		return c.SendBadRequest(ctx, err.Error())
 	}
-	s, err := c.scheduleService.Update(ctx.Context(), id, f)
+	s, err := c.scheduleService.Update(ctx.Context(), middleware.UserID(ctx), id, f)
 	if err != nil {
 		return c.sendErr(ctx, err)
 	}
@@ -139,7 +148,7 @@ func (c *ScheduleController) Delete(ctx *fiber.Ctx) error {
 	if err != nil {
 		return c.SendNotFound(ctx, "schedule not found")
 	}
-	if err := c.scheduleService.Delete(ctx.Context(), id); err != nil {
+	if err := c.scheduleService.Delete(ctx.Context(), middleware.UserID(ctx), id); err != nil {
 		return c.sendErr(ctx, err)
 	}
 	return c.SendSuccessWithMessage(ctx, nil, "schedule deleted")
@@ -151,7 +160,7 @@ func (c *ScheduleController) Run(ctx *fiber.Ctx) error {
 	if err != nil {
 		return c.SendNotFound(ctx, "schedule not found")
 	}
-	taskID, err := c.scheduleService.RunNow(ctx.Context(), id)
+	taskID, err := c.scheduleService.RunNow(ctx.Context(), middleware.UserID(ctx), id)
 	if err != nil {
 		return c.sendErr(ctx, err)
 	}

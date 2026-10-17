@@ -30,59 +30,59 @@ func required(field string, v *string) error {
 // ProjectService manages projects.
 type ProjectService struct{ pool *pgxpool.Pool }
 
-func (s *ProjectService) List(ctx context.Context) ([]*models.Project, error) {
-	return queries.ListProjects(ctx, s.pool)
+func (s *ProjectService) List(ctx context.Context, user uuid.UUID) ([]*models.Project, error) {
+	return queries.ListProjects(ctx, s.pool, user)
 }
 
-func (s *ProjectService) Create(ctx context.Context, name, instructions string) (*models.Project, error) {
+func (s *ProjectService) Create(ctx context.Context, user uuid.UUID, name, instructions string) (*models.Project, error) {
 	if err := required("name", &name); err != nil {
 		return nil, err
 	}
-	return queries.InsertProject(ctx, s.pool, name, instructions)
+	return queries.InsertProject(ctx, s.pool, user, name, instructions)
 }
 
 // Update sets the non-nil fields.
-func (s *ProjectService) Update(ctx context.Context, id uuid.UUID, name, instructions *string) (*models.Project, error) {
+func (s *ProjectService) Update(ctx context.Context, user, id uuid.UUID, name, instructions *string) (*models.Project, error) {
 	if err := required("name", name); err != nil {
 		return nil, err
 	}
-	return queries.UpdateProject(ctx, s.pool, id, name, instructions)
+	return queries.UpdateProject(ctx, s.pool, user, id, name, instructions)
 }
 
 // Delete removes a project; its tasks stay, with no project.
-func (s *ProjectService) Delete(ctx context.Context, id uuid.UUID) error {
+func (s *ProjectService) Delete(ctx context.Context, user, id uuid.UUID) error {
 	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
-		if err := queries.ClearTasksProject(ctx, tx, id); err != nil {
+		if err := queries.DeleteProject(ctx, tx, user, id); err != nil {
 			return err
 		}
-		return queries.DeleteProject(ctx, tx, id)
+		return queries.ClearTasksProject(ctx, tx, id)
 	})
 }
 
 // KnowledgeService manages knowledge entries.
 type KnowledgeService struct{ pool *pgxpool.Pool }
 
-func (s *KnowledgeService) List(ctx context.Context) ([]*models.Knowledge, error) {
-	return queries.ListKnowledge(ctx, s.pool, false)
+func (s *KnowledgeService) List(ctx context.Context, user uuid.UUID) ([]*models.Knowledge, error) {
+	return queries.ListKnowledge(ctx, s.pool, user, false)
 }
 
-func (s *KnowledgeService) Create(ctx context.Context, title, content string, enabled bool) (*models.Knowledge, error) {
+func (s *KnowledgeService) Create(ctx context.Context, user uuid.UUID, title, content string, enabled bool) (*models.Knowledge, error) {
 	if err := required("title", &title); err != nil {
 		return nil, err
 	}
-	return queries.InsertKnowledge(ctx, s.pool, title, content, enabled)
+	return queries.InsertKnowledge(ctx, s.pool, user, title, content, enabled)
 }
 
 // Update sets the non-nil fields.
-func (s *KnowledgeService) Update(ctx context.Context, id uuid.UUID, title, content *string, enabled *bool) (*models.Knowledge, error) {
+func (s *KnowledgeService) Update(ctx context.Context, user, id uuid.UUID, title, content *string, enabled *bool) (*models.Knowledge, error) {
 	if err := required("title", title); err != nil {
 		return nil, err
 	}
-	return queries.UpdateKnowledge(ctx, s.pool, id, title, content, enabled)
+	return queries.UpdateKnowledge(ctx, s.pool, user, id, title, content, enabled)
 }
 
-func (s *KnowledgeService) Delete(ctx context.Context, id uuid.UUID) error {
-	return queries.DeleteKnowledge(ctx, s.pool, id)
+func (s *KnowledgeService) Delete(ctx context.Context, user, id uuid.UUID) error {
+	return queries.DeleteKnowledge(ctx, s.pool, user, id)
 }
 
 // SkillService manages skills.
@@ -104,30 +104,30 @@ func skillTaken(name string, err error) error {
 	return err
 }
 
-func (s *SkillService) List(ctx context.Context) ([]*models.Skill, error) {
-	return queries.ListSkills(ctx, s.pool)
+func (s *SkillService) List(ctx context.Context, user uuid.UUID) ([]*models.Skill, error) {
+	return queries.ListSkills(ctx, s.pool, user)
 }
 
-func (s *SkillService) Create(ctx context.Context, name, description, instructions string) (*models.Skill, error) {
+func (s *SkillService) Create(ctx context.Context, user uuid.UUID, name, description, instructions string) (*models.Skill, error) {
 	if err := validSkillName(&name); err != nil {
 		return nil, err
 	}
-	sk, err := queries.InsertSkill(ctx, s.pool, name, description, instructions)
+	sk, err := queries.InsertSkill(ctx, s.pool, user, name, description, instructions)
 	return sk, skillTaken(name, err)
 }
 
 // Update sets the non-nil fields.
-func (s *SkillService) Update(ctx context.Context, id uuid.UUID, name, description, instructions *string) (*models.Skill, error) {
+func (s *SkillService) Update(ctx context.Context, user, id uuid.UUID, name, description, instructions *string) (*models.Skill, error) {
 	if err := validSkillName(name); err != nil {
 		return nil, err
 	}
-	sk, err := queries.UpdateSkill(ctx, s.pool, id, name, description, instructions)
+	sk, err := queries.UpdateSkill(ctx, s.pool, user, id, name, description, instructions)
 	if name != nil {
 		err = skillTaken(*name, err)
 	}
 	return sk, err
 }
 
-func (s *SkillService) Delete(ctx context.Context, id uuid.UUID) error {
-	return queries.DeleteSkill(ctx, s.pool, id)
+func (s *SkillService) Delete(ctx context.Context, user, id uuid.UUID) error {
+	return queries.DeleteSkill(ctx, s.pool, user, id)
 }

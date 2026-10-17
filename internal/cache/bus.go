@@ -17,9 +17,10 @@ import (
 
 // Frame kinds carried on a task's channel.
 const (
-	FrameEvent = "event" // a persisted event; Seq and Event are set
-	FrameDelta = "delta" // streaming text; not persisted
-	FrameStop  = "stop"  // the user asked the running task to stop
+	FrameEvent    = "event"    // a persisted event; Seq and Event are set
+	FrameDelta    = "delta"    // streaming text; not persisted
+	FrameActivity = "activity" // Text is "thinking" or the tool being written; not persisted
+	FrameStop     = "stop"     // the user asked the running task to stop
 )
 
 // Frame is one message on a task's live channel.

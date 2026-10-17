@@ -16,13 +16,13 @@ import (
 	"github.com/google/uuid"
 )
 
-const taskColumns = `id, created_at, updated_at, prompt, status, mode, project_id, schedule_id, favorite, archived,
+const taskColumns = `id, user_id, created_at, updated_at, prompt, status, mode, project_id, schedule_id, favorite, archived,
 	input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, event_count,
 	pending, partial_results, always_allowed, stop_requested`
 
 func scanTask(row scannable) (*models.Task, error) {
 	var t models.Task
-	err := row.Scan(&t.ID, &t.CreatedAt, &t.UpdatedAt, &t.Prompt, &t.Status, &t.Mode, &t.ProjectID, &t.ScheduleID,
+	err := row.Scan(&t.ID, &t.UserID, &t.CreatedAt, &t.UpdatedAt, &t.Prompt, &t.Status, &t.Mode, &t.ProjectID, &t.ScheduleID,
 		&t.Favorite, &t.Archived, &t.InputTokens, &t.OutputTokens, &t.CacheReadTokens, &t.CacheWriteTokens,
 		&t.EventCount, &t.Pending, &t.PartialResults, &t.AlwaysAllowed, &t.StopRequested)
 	if err != nil {
@@ -48,16 +48,16 @@ func scanTasks(db DBTX, ctx context.Context, sql string, args ...any) ([]*models
 	return out, rows.Err()
 }
 
-// InsertTask inserts t (ID, Prompt, Status, Mode, ProjectID, ScheduleID).
+// InsertTask inserts t (ID, UserID, Prompt, Status, Mode, ProjectID, ScheduleID).
 func InsertTask(ctx context.Context, db DBTX, t *models.Task) error {
 	if t.ID == uuid.Nil {
 		t.ID = uuid.New()
 	}
 	row := db.QueryRow(ctx, `
-		INSERT INTO tasks (id, created_at, updated_at, prompt, status, mode, project_id, schedule_id)
-		VALUES ($1, now(), now(), $2, $3, $4, $5, $6)
+		INSERT INTO tasks (id, user_id, created_at, updated_at, prompt, status, mode, project_id, schedule_id)
+		VALUES ($1, $7, now(), now(), $2, $3, $4, $5, $6)
 		RETURNING `+taskColumns,
-		t.ID, t.Prompt, t.Status, t.Mode, t.ProjectID, t.ScheduleID)
+		t.ID, t.Prompt, t.Status, t.Mode, t.ProjectID, t.ScheduleID, t.UserID)
 	got, err := scanTask(row)
 	if err != nil {
 		return err
@@ -66,7 +66,12 @@ func InsertTask(ctx context.Context, db DBTX, t *models.Task) error {
 	return nil
 }
 
-// GetTask returns one task.
+// GetUserTask returns one of userID's tasks; another user's task is ErrNotFound.
+func GetUserTask(ctx context.Context, db DBTX, userID, id uuid.UUID) (*models.Task, error) {
+	return scanTask(db.QueryRow(ctx, `SELECT `+taskColumns+` FROM tasks WHERE id = $1 AND user_id = $2`, id, userID))
+}
+
+// GetTask returns one task whatever its owner; the harness uses it for a task it already holds.
 func GetTask(ctx context.Context, db DBTX, id uuid.UUID) (*models.Task, error) {
 	return scanTask(db.QueryRow(ctx, `SELECT `+taskColumns+` FROM tasks WHERE id = $1`, id))
 }
@@ -77,24 +82,25 @@ func LockTask(ctx context.Context, db DBTX, id uuid.UUID) (*models.Task, error) 
 	return scanTask(db.QueryRow(ctx, `SELECT `+taskColumns+` FROM tasks WHERE id = $1 FOR UPDATE`, id))
 }
 
-// ListTasks returns tasks newest updated_at first, filtered by archived and
-// (when projectID is non-nil) project.
-func ListTasks(ctx context.Context, db DBTX, archived bool, projectID *uuid.UUID) ([]*models.Task, error) {
+// ListTasks returns userID's tasks newest updated_at first, filtered by
+// archived and (when projectID is non-nil) project.
+func ListTasks(ctx context.Context, db DBTX, userID uuid.UUID, archived bool, projectID *uuid.UUID) ([]*models.Task, error) {
 	return scanTasks(db, ctx, `SELECT `+taskColumns+` FROM tasks
-		WHERE archived = $1 AND ($2::uuid IS NULL OR project_id = $2)
-		ORDER BY updated_at DESC, id`, archived, projectID)
+		WHERE user_id = $3 AND archived = $1 AND ($2::uuid IS NULL OR project_id = $2)
+		ORDER BY updated_at DESC, id`, archived, projectID, userID)
 }
 
-// ListTasksCreatedSince returns tasks created at or after since.
-func ListTasksCreatedSince(ctx context.Context, db DBTX, since time.Time) ([]*models.Task, error) {
-	return scanTasks(db, ctx, `SELECT `+taskColumns+` FROM tasks WHERE created_at >= $1`, since)
+// ListTasksCreatedSince returns userID's tasks created at or after since.
+func ListTasksCreatedSince(ctx context.Context, db DBTX, userID uuid.UUID, since time.Time) ([]*models.Task, error) {
+	return scanTasks(db, ctx, `SELECT `+taskColumns+` FROM tasks WHERE user_id = $1 AND created_at >= $2`, userID, since)
 }
 
-// UpdateTaskFlags sets favorite and archived (nil leaves a flag unchanged).
-func UpdateTaskFlags(ctx context.Context, db DBTX, id uuid.UUID, favorite, archived *bool) (*models.Task, error) {
+// UpdateTaskFlags sets favorite and archived on one of userID's tasks (nil
+// leaves a flag unchanged).
+func UpdateTaskFlags(ctx context.Context, db DBTX, userID, id uuid.UUID, favorite, archived *bool) (*models.Task, error) {
 	return scanTask(db.QueryRow(ctx, `
 		UPDATE tasks SET favorite = COALESCE($2, favorite), archived = COALESCE($3, archived), updated_at = now()
-		WHERE id = $1 RETURNING `+taskColumns, id, favorite, archived))
+		WHERE id = $1 AND user_id = $4 RETURNING `+taskColumns, id, favorite, archived, userID))
 }
 
 // SetTaskRunState stores what a run needs to resume: the pending call and the

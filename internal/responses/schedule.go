@@ -15,6 +15,8 @@ import (
 // ScheduleDTO is API.md's ScheduledTask.
 type ScheduleDTO struct {
 	ID        string  `json:"id"`
+	Title     string  `json:"title"`
+	Kind      string  `json:"kind"`
 	Prompt    string  `json:"prompt"`
 	Mode      string  `json:"mode"`
 	ProjectID *string `json:"projectId"`
@@ -30,7 +32,7 @@ type ScheduleDTO struct {
 // ScheduleResponse maps a schedule onto its DTO.
 func ScheduleResponse(s *models.Schedule) ScheduleDTO {
 	d := ScheduleDTO{
-		ID: s.ID.String(), Prompt: s.Prompt, Mode: s.Mode, Repeat: s.Repeat, Time: s.TimeOfDay,
+		ID: s.ID.String(), Title: s.Title, Kind: s.Kind, Prompt: s.Prompt, Mode: s.Mode, Repeat: s.Repeat, Time: s.TimeOfDay,
 		Weekday: s.Weekday, Enabled: s.Enabled, LastRunAt: optTime(s.LastRunAt), NextRunAt: optTime(s.NextRunAt),
 		CreatedAt: Time(s.CreatedAt),
 	}

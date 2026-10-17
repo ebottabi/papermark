@@ -28,7 +28,7 @@ func TestDevicesRegisterIsIdempotentByToken(t *testing.T) {
 	if code, body := api.do("POST", "/v1/devices", `{"token":"abc","environment":"production"}`); code != 200 || body.data()["environment"] != "production" || body.data()["platform"] != "ios" {
 		t.Fatalf("re-register: %d %v", code, body)
 	}
-	ds, _ := queries.ListDevices(ctx, pool)
+	ds, _ := queries.ListDevices(ctx, pool, api.user)
 	if len(ds) != 1 || ds[0].Environment != "production" {
 		t.Fatalf("devices: %+v", ds)
 	}
@@ -43,10 +43,22 @@ func TestDevicesRegisterIsIdempotentByToken(t *testing.T) {
 			t.Fatalf("delete %d: %d %v", i, code, body)
 		}
 	}
-	if ds, _ := queries.ListDevices(ctx, pool); len(ds) != 0 {
+	if ds, _ := queries.ListDevices(ctx, pool, api.user); len(ds) != 0 {
 		t.Fatalf("devices after delete: %+v", ds)
 	}
 	if code, _ := api.do("POST", "/v1/devices", `{"token":"abc","environment":"sandbox"}`); code != 200 {
 		t.Fatalf("register after delete: %d", code)
+	}
+
+	// A phone that signs in as another user moves its token to that user,
+	// so pushes for the first user stop reaching it.
+	other := api.as(newUser(t, pool))
+	if code, _ := other.do("POST", "/v1/devices", `{"token":"abc","environment":"sandbox"}`); code != 200 {
+		t.Fatalf("register as other: %d", code)
+	}
+	mine, _ := queries.ListDevices(ctx, pool, api.user)
+	theirs, _ := queries.ListDevices(ctx, pool, other.user)
+	if len(mine) != 0 || len(theirs) != 1 {
+		t.Fatalf("after move: mine %d theirs %d", len(mine), len(theirs))
 	}
 }

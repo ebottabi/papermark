@@ -16,10 +16,11 @@ import (
 
 	"papermark/internal/cache"
 	"papermark/internal/config"
-	"papermark/internal/integrations/anthropic"
+	"papermark/internal/harness"
 	"papermark/internal/models/queries"
 	"papermark/internal/notifications"
 	"papermark/internal/notifications/apns"
+	"papermark/internal/secretbox"
 	"papermark/internal/services/jobs"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -31,7 +32,7 @@ import (
 type Services struct {
 	Jobs      *jobs.Service
 	Tasks     *TaskService
-	Agent     *AgentService
+	Harness   *harness.Harness
 	Projects  *ProjectService
 	Knowledge *KnowledgeService
 	Skills    *SkillService
@@ -39,39 +40,49 @@ type Services struct {
 	Devices   *DeviceService
 	Push      *notifications.PushService
 	Schedules *ScheduleService
+	Prefs     *PreferenceService
+	Updates   *UpdateService
+	Memories  *MemoryService
 	MCP       *ConnectorService
-
-	// Hooks other packages set after New, before serving.
-	Connectors ConnectorProvider
-	Notifier   Notifier
+	Auth      *AuthService
 }
 
 // New wires the services. rdb may be nil (single-process mode: the bus is in-process).
 func New(cfg *config.Config, pool *pgxpool.Pool, rdb *redis.Client) *Services {
+	box, err := secretbox.New(cfg.TokenKey)
+	if err != nil {
+		log.Fatalf("services: token encryption: %v", err)
+	}
+	if box == nil {
+		log.Println("WARNING: TOKEN_ENCRYPTION_KEY is not set; OAuth tokens are stored in plaintext")
+	}
 	s := &Services{
 		Jobs:      jobs.NewService(pool),
 		Bus:       cache.NewBus(rdb),
 		Devices:   NewDeviceService(pool),
 		Push:      notifications.NewPushService(pool, newAPNSSender(cfg.APNS)),
 		Schedules: NewScheduleService(pool),
-		MCP:       NewConnectorService(pool, cfg.PublicURL, cfg.Connectors),
+		MCP:       NewConnectorService(pool, cfg.PublicURL, cfg.Connectors, box),
 	}
-	ev := &events{pool: pool, bus: s.Bus, s: s}
-	s.Agent = &AgentService{
-		pool: pool, ev: ev, bus: s.Bus, s: s,
-		client:     anthropic.New(cfg.Agent.AnthropicAPIKey, cfg.Agent.AnthropicBaseURL),
-		workspaces: cfg.WorkspaceDir,
-		model:      cfg.Agent.Model,
-		maxTokens:  int64(cfg.Agent.MaxTokens),
-		maxSteps:   cfg.Agent.MaxSteps,
+	s.Harness = harness.New(cfg.Agent, cfg.WorkspaceDir, pool, s.Bus)
+	s.Harness.Connectors = s.MCP
+	s.Harness.Notifier = s.Push
+	s.Prefs = NewPreferenceService(pool)
+	if nc := (notifications.NtfyConfig{URL: cfg.Ntfy.URL, TopicPrefix: cfg.Ntfy.TopicPrefix, Secret: cfg.Ntfy.TopicSecret, Token: cfg.Ntfy.Token}); nc.Configured() {
+		s.Harness.Notifier = notifications.Fan{s.Push, notifications.NewNtfy(pool, nc)}
+		s.Prefs.ntfy = &nc
+	} else if cfg.Ntfy.URL != "" {
+		log.Println("WARNING: ntfy is off: NTFY_TOPIC and NTFY_TOPIC_SECRET (or TOKEN_ENCRYPTION_KEY) are required")
 	}
-	s.Tasks = &TaskService{pool: pool, ev: ev, s: s}
+	s.Harness.Routines = s.Schedules
+	s.Updates = NewUpdateService(pool)
+	s.Memories = NewMemoryService(pool)
+	s.Tasks = &TaskService{pool: pool, s: s}
 	s.Projects = &ProjectService{pool: pool}
 	s.Knowledge = &KnowledgeService{pool: pool}
 	s.Skills = &SkillService{pool: pool}
-	s.Connectors = s.MCP
-	s.Notifier = s.Push
 	s.Schedules.SetTaskCreator(s.Tasks)
+	s.Auth = NewAuthService(pool, cfg.Auth, NewGoogleVerifier(GoogleCertsURL, cfg.Auth.GoogleClientIDs))
 	return s
 }
 

@@ -25,10 +25,14 @@ import (
 	"time"
 
 	"papermark/internal/config"
+	"papermark/internal/harness"
+	"papermark/internal/integrations/gmail"
 	"papermark/internal/integrations/mcp"
 	"papermark/internal/models"
 	"papermark/internal/models/queries"
+	"papermark/internal/secretbox"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/oauth2"
 )
@@ -53,25 +57,35 @@ type ConnectorService struct {
 	http        *http.Client
 	redirectURI string
 	catalog     map[string]config.ConnectorConfig
+	box         *secretbox.Box // seals stored tokens; nil keeps them in plaintext
 }
 
 // NewConnectorService constructs a ConnectorService whose OAuth redirect URI
 // is publicURL + "/v1/oauth/callback". Catalog connectors are listed before
-// they are added and are added by their first Authorize.
-func NewConnectorService(pool *pgxpool.Pool, publicURL string, catalog map[string]config.ConnectorConfig) *ConnectorService {
+// they are added and are added by their first Authorize. box seals the OAuth
+// tokens at rest; nil stores them in plaintext.
+func NewConnectorService(pool *pgxpool.Pool, publicURL string, catalog map[string]config.ConnectorConfig, box *secretbox.Box) *ConnectorService {
 	return &ConnectorService{
 		pool:        pool,
 		http:        &http.Client{Timeout: 30 * time.Second},
 		redirectURI: strings.TrimRight(publicURL, "/") + "/v1/oauth/callback",
 		catalog:     catalog,
+		box:         box,
 	}
+}
+
+func (s *ConnectorService) kind(name string) string {
+	if k := s.catalog[name].Kind; k != "" {
+		return k
+	}
+	return models.ConnectorMCP
 }
 
 // List returns every connector with the status of its latest connection,
 // plus each catalog connector not added yet: needs_auth, or error when the
 // server has no URL for it.
-func (s *ConnectorService) List(ctx context.Context) ([]*models.Connector, error) {
-	cs, err := queries.ListConnectors(ctx, s.pool)
+func (s *ConnectorService) List(ctx context.Context, user uuid.UUID) ([]*models.Connector, error) {
+	cs, err := queries.ListConnectors(ctx, s.pool, user)
 	if err != nil {
 		return nil, err
 	}
@@ -88,7 +102,7 @@ func (s *ConnectorService) List(ctx context.Context) ([]*models.Connector, error
 		if added[name] {
 			continue
 		}
-		c := &models.Connector{Name: name, URL: s.catalog[name].URL, Status: models.ConnectorNeedsAuth}
+		c := &models.Connector{Name: name, Kind: s.kind(name), URL: s.catalog[name].URL, Status: models.ConnectorNeedsAuth}
 		if c.URL == "" {
 			msg := "Not set up on this server"
 			c.Status, c.Error = models.ConnectorError, &msg
@@ -100,14 +114,14 @@ func (s *ConnectorService) List(ctx context.Context) ([]*models.Connector, error
 
 // Add stores a connector and tries to connect, so the result carries
 // connected, needs_auth or error with its tool count.
-func (s *ConnectorService) Add(ctx context.Context, name, rawURL string) (*models.Connector, error) {
+func (s *ConnectorService) Add(ctx context.Context, user uuid.UUID, name, rawURL string) (*models.Connector, error) {
 	if !connectorNamePattern.MatchString(name) {
 		return nil, fmt.Errorf("%w: name must be 1-32 letters, digits, _ or -", ErrInvalidConnector)
 	}
 	if u, err := url.Parse(rawURL); err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
 		return nil, fmt.Errorf("%w: url must be an http(s) URL", ErrInvalidConnector)
 	}
-	c := &models.Connector{Name: name, URL: rawURL, Status: models.ConnectorNeedsAuth}
+	c := &models.Connector{UserID: user, Name: name, URL: rawURL, Status: models.ConnectorNeedsAuth}
 	if err := queries.CreateConnector(ctx, s.pool, c); err != nil {
 		return nil, err
 	}
@@ -117,16 +131,20 @@ func (s *ConnectorService) Add(ctx context.Context, name, rawURL string) (*model
 	return c, nil
 }
 
-// Delete removes a connector and its OAuth client and tokens.
-func (s *ConnectorService) Delete(ctx context.Context, name string) error {
+// Delete removes a connector and its OAuth client and tokens. A gmail
+// connector's token is revoked at Google first, on a best-effort basis.
+func (s *ConnectorService) Delete(ctx context.Context, user uuid.UUID, name string) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx)
-	c, err := queries.GetConnectorByName(ctx, tx, name)
+	c, err := queries.GetConnectorByName(ctx, tx, user, name)
 	if err != nil {
 		return err
+	}
+	if c.Kind == models.ConnectorGmail {
+		s.revoke(ctx, c)
 	}
 	if err := queries.SoftDeleteConnector(ctx, tx, c.ID); err != nil {
 		return err
@@ -137,31 +155,78 @@ func (s *ConnectorService) Delete(ctx context.Context, name string) error {
 	return tx.Commit(ctx)
 }
 
-// Authorize discovers the connector's authorization server, registers a
+// revoke asks Google to invalidate c's token. Failures are logged and ignored:
+// the connector is deleted either way.
+func (s *ConnectorService) revoke(ctx context.Context, c *models.Connector) {
+	cred, err := queries.GetOAuthCredential(ctx, s.pool, c.ID)
+	if err != nil {
+		return
+	}
+	if err := s.unseal(cred); err != nil {
+		log.Printf("connector %s: revoke: %v", c.Name, err)
+		return
+	}
+	tok := cred.RefreshToken
+	if tok == "" {
+		tok = cred.AccessToken
+	}
+	endpoint := s.catalog[c.Name].RevokeURL
+	if tok == "" || endpoint == "" {
+		return
+	}
+	rctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(rctx, http.MethodPost, endpoint, strings.NewReader(url.Values{"token": {tok}}.Encode()))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	resp, err := s.http.Do(req)
+	if err != nil {
+		log.Printf("connector %s: revoke: %v", c.Name, err)
+		return
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("connector %s: revoke: status %d", c.Name, resp.StatusCode)
+	}
+}
+
+// Authorize discovers the connector's authorization server (a gmail
+// connector uses Google's endpoints from the catalog), registers a
 // client unless the catalog supplies one, and returns the URL the user opens
 // to grant access (PKCE S256). A catalog connector is added on first use.
-func (s *ConnectorService) Authorize(ctx context.Context, name string) (string, error) {
+func (s *ConnectorService) Authorize(ctx context.Context, user uuid.UUID, name string) (string, error) {
 	entry, inCatalog := s.catalog[name]
-	c, err := queries.GetConnectorByName(ctx, s.pool, name)
+	c, err := queries.GetConnectorByName(ctx, s.pool, user, name)
 	if errors.Is(err, queries.ErrNotFound) && inCatalog && entry.URL != "" {
-		c = &models.Connector{Name: name, URL: entry.URL, Status: models.ConnectorNeedsAuth}
+		c = &models.Connector{UserID: user, Name: name, Kind: s.kind(name), URL: entry.URL, Status: models.ConnectorNeedsAuth}
 		err = queries.CreateConnector(ctx, s.pool, c)
 	}
 	if err != nil {
 		return "", err
 	}
-	as, err := mcp.Discover(ctx, c.URL, s.http)
-	if err != nil {
+	var as *mcp.AuthServer
+	if c.Kind == models.ConnectorGmail {
+		as = &mcp.AuthServer{AuthURL: entry.AuthURL, TokenURL: entry.TokenURL}
+	} else if as, err = mcp.Discover(ctx, c.URL, s.http); err != nil {
 		return "", fmt.Errorf("discover authorization server: %w", err)
 	}
 	if len(entry.Scopes) > 0 {
 		as.Scopes = entry.Scopes
 	}
 	clientID, secret := entry.ClientID, entry.ClientSecret
+	if clientID == "" && c.Kind == models.ConnectorGmail {
+		return "", errors.New("gmail: no OAuth client is configured (GMAIL_CLIENT_ID)")
+	}
 	if clientID == "" {
 		if clientID, secret, err = mcp.Register(ctx, as, s.redirectURI, s.http); err != nil {
 			return "", err
 		}
+	}
+	sealedSecret, err := s.box.Seal(secret)
+	if err != nil {
+		return "", err
 	}
 	raw := make([]byte, 32)
 	if _, err := rand.Read(raw); err != nil {
@@ -170,14 +235,17 @@ func (s *ConnectorService) Authorize(ctx context.Context, name string) (string, 
 	state := base64.RawURLEncoding.EncodeToString(raw)
 	expires := time.Now().Add(oauthStateTTL).UTC()
 	cred := &models.OAuthCredential{
-		ConnectorID: c.ID, Resource: as.Resource, AuthURL: as.AuthURL, TokenURL: as.TokenURL,
-		Scopes: strings.Join(as.Scopes, " "), ClientID: clientID, ClientSecret: secret,
+		UserID: c.UserID, ConnectorID: c.ID, Resource: as.Resource, AuthURL: as.AuthURL, TokenURL: as.TokenURL,
+		Scopes: strings.Join(as.Scopes, " "), ClientID: clientID, ClientSecret: sealedSecret,
 		Verifier: oauth2.GenerateVerifier(), StateHash: hashState(state), StateExpiresAt: &expires,
 	}
 	if err := queries.UpsertOAuthPending(ctx, s.pool, cred); err != nil {
 		return "", err
 	}
-	opts := []oauth2.AuthCodeOption{oauth2.S256ChallengeOption(cred.Verifier), oauth2.SetAuthURLParam("resource", cred.Resource)}
+	opts := []oauth2.AuthCodeOption{oauth2.S256ChallengeOption(cred.Verifier)}
+	if cred.Resource != "" { // Google rejects RFC 8707 resource indicators
+		opts = append(opts, oauth2.SetAuthURLParam("resource", cred.Resource))
+	}
 	for k, v := range entry.AuthParams {
 		opts = append(opts, oauth2.SetAuthURLParam(k, v))
 	}
@@ -185,7 +253,8 @@ func (s *ConnectorService) Authorize(ctx context.Context, name string) (string, 
 }
 
 // Callback completes an authorization: it consumes state (single use,
-// expiring), exchanges code for tokens and reconnects. It returns the
+// expiring, bound to the user who started it through the connector's
+// credential row), exchanges code for tokens and reconnects. It returns the
 // connector whenever state matched one, even when a later step failed.
 func (s *ConnectorService) Callback(ctx context.Context, state, code, oauthError string) (*models.Connector, error) {
 	if state == "" {
@@ -205,13 +274,22 @@ func (s *ConnectorService) Callback(ctx context.Context, state, code, oauthError
 	if oauthError != "" || code == "" {
 		return c, fmt.Errorf("authorization denied: %q", oauthError)
 	}
-	tok, err := s.oauthConfig(cred).Exchange(context.WithValue(ctx, oauth2.HTTPClient, s.http), code,
-		oauth2.VerifierOption(cred.Verifier), oauth2.SetAuthURLParam("resource", cred.Resource))
+	if err := s.unseal(cred); err != nil {
+		return c, err
+	}
+	opts := []oauth2.AuthCodeOption{oauth2.VerifierOption(cred.Verifier)}
+	if cred.Resource != "" {
+		opts = append(opts, oauth2.SetAuthURLParam("resource", cred.Resource))
+	}
+	tok, err := s.oauthConfig(cred).Exchange(context.WithValue(ctx, oauth2.HTTPClient, s.http), code, opts...)
 	if err != nil {
 		return c, fmt.Errorf("token exchange: %w", err)
 	}
 	if err := s.saveToken(ctx, c, tok); err != nil {
 		return c, err
+	}
+	if c.Kind == models.ConnectorGmail {
+		return c, s.connectGmail(ctx, c)
 	}
 	sess, _, err := s.connect(ctx, c)
 	if err != nil {
@@ -221,16 +299,16 @@ func (s *ConnectorService) Callback(ctx context.Context, state, code, oauthError
 	return c, nil
 }
 
-// Snapshot connects to every connector and returns their tools for one task,
+// Snapshot connects to every one of the user's connectors and returns their tools for one task,
 // named <connector>_<tool>. Connectors that fail are skipped and their status
 // records why. A name that collides after sanitizing keeps its first tool.
 // shortcut: connects one connector at a time, each bounded by connectTimeout; connect concurrently if task start latency matters.
-func (s *ConnectorService) Snapshot(ctx context.Context) (*ConnectorToolset, error) {
-	cs, err := queries.ListConnectors(ctx, s.pool)
+func (s *ConnectorService) Snapshot(ctx context.Context, userID uuid.UUID) (*harness.ConnectorToolset, error) {
+	cs, err := queries.ListConnectors(ctx, s.pool, userID)
 	if err != nil {
 		return nil, err
 	}
-	set := &ConnectorToolset{Handlers: map[string]ConnectorHandler{}, NeedsApproval: map[string]bool{}}
+	set := &harness.ConnectorToolset{Handlers: map[string]harness.ConnectorHandler{}, NeedsApproval: map[string]bool{}, NoAlways: map[string]bool{}}
 	var sessions []*mcp.Session
 	set.Close = func() {
 		for _, sess := range sessions {
@@ -238,6 +316,10 @@ func (s *ConnectorService) Snapshot(ctx context.Context) (*ConnectorToolset, err
 		}
 	}
 	for _, c := range cs {
+		if c.Kind == models.ConnectorGmail {
+			s.addGmail(ctx, set, c)
+			continue
+		}
 		sess, tools, err := s.connect(ctx, c)
 		if err != nil {
 			continue
@@ -248,10 +330,14 @@ func (s *ConnectorService) Snapshot(ctx context.Context) (*ConnectorToolset, err
 			if _, dup := set.Handlers[name]; dup {
 				continue
 			}
-			set.Tools = append(set.Tools, ConnectorTool{Name: name, Description: "[" + c.Name + "] " + t.Description, InputSchema: t.InputSchema})
-			toolName := t.Name
+			set.Tools = append(set.Tools, harness.ConnectorTool{Name: name, Description: "[" + c.Name + "] " + t.Description, InputSchema: t.InputSchema})
+			toolName, c := t.Name, c
 			set.Handlers[name] = func(ctx context.Context, input json.RawMessage) (string, bool, error) {
-				return sess.Call(ctx, toolName, input)
+				text, isErr, err := sess.Call(ctx, toolName, input)
+				if errors.Is(err, mcp.ErrNeedsAuth) {
+					return s.needsReconnect(c), true, nil
+				}
+				return text, isErr, err
 			}
 			if !t.ReadOnly {
 				set.NeedsApproval[name] = true
@@ -260,6 +346,105 @@ func (s *ConnectorService) Snapshot(ctx context.Context) (*ConnectorToolset, err
 	}
 	sort.Slice(set.Tools, func(i, j int) bool { return set.Tools[i].Name < set.Tools[j].Name })
 	return set, nil
+}
+
+// addGmail adds c's Gmail tools to set. A connector without a usable sign-in
+// is skipped, as a failed MCP connection is.
+func (s *ConnectorService) addGmail(ctx context.Context, set *harness.ConnectorToolset, c *models.Connector) {
+	if c.Status == models.ConnectorNeedsAuth {
+		return
+	}
+	ts, err := s.tokenSource(ctx, c)
+	if err != nil {
+		log.Printf("connector %s: %v", c.Name, err)
+		return
+	}
+	if ts == nil {
+		s.markNeedsAuth(c)
+		return
+	}
+	base := s.http.Transport
+	client := &gmail.Client{
+		HTTP:    &http.Client{Transport: &oauth2.Transport{Source: ts, Base: base}, Timeout: 30 * time.Second},
+		BaseURL: s.catalog[c.Name].URL,
+	}
+	for _, t := range gmail.Tools(client, historyCursor{s.pool, c}) {
+		name := mcp.ToolName(c.Name, t.Name)
+		set.Tools = append(set.Tools, harness.ConnectorTool{Name: name, Description: "[" + c.Name + "] " + t.Description, InputSchema: t.Schema})
+		run := t.Run
+		set.Handlers[name] = func(ctx context.Context, input json.RawMessage) (string, bool, error) {
+			text, err := run(ctx, harness.WorkspaceFrom(ctx), input)
+			if errors.Is(err, gmail.ErrNeedsAuth) {
+				return s.needsReconnect(c), true, nil
+			}
+			return text, false, err
+		}
+		set.NeedsApproval[name] = t.Approval
+		set.NoAlways[name] = t.NoAlways
+	}
+}
+
+// historyCursor keeps a gmail connector's digest position in its row.
+type historyCursor struct {
+	pool *pgxpool.Pool
+	c    *models.Connector
+}
+
+func (h historyCursor) Get(ctx context.Context) (string, error) {
+	c, err := queries.GetConnector(ctx, h.pool, h.c.ID)
+	if err != nil {
+		return "", err
+	}
+	return c.HistoryID, nil
+}
+
+func (h historyCursor) Set(ctx context.Context, id string) error {
+	return queries.UpdateConnectorHistory(ctx, h.pool, h.c.ID, id)
+}
+
+// connectGmail checks the stored sign-in against Google, records the mailbox
+// address and the history position digests start from, and marks c connected.
+func (s *ConnectorService) connectGmail(ctx context.Context, c *models.Connector) error {
+	ts, err := s.tokenSource(ctx, c)
+	if err != nil || ts == nil {
+		return fmt.Errorf("gmail: no usable token: %v", err)
+	}
+	client := &gmail.Client{
+		HTTP:    &http.Client{Transport: &oauth2.Transport{Source: ts, Base: s.http.Transport}, Timeout: connectTimeout},
+		BaseURL: s.catalog[c.Name].URL,
+	}
+	prof, err := client.Profile(ctx)
+	if err != nil {
+		msg := err.Error()
+		c.Status, c.Error = models.ConnectorError, &msg
+		if errors.Is(err, gmail.ErrNeedsAuth) {
+			c.Status, c.Error = models.ConnectorNeedsAuth, nil
+		}
+		if uerr := queries.UpdateConnectorStatus(ctx, s.pool, c); uerr != nil {
+			log.Printf("connector %s: %v", c.Name, uerr)
+		}
+		return err
+	}
+	c.Account, c.HistoryID = &prof.Email, prof.HistoryID
+	if err := queries.UpdateConnectorAccount(ctx, s.pool, c); err != nil {
+		return err
+	}
+	c.Status, c.Error, c.Tools = models.ConnectorConnected, nil, len(gmail.Tools(client, historyCursor{s.pool, c}))
+	return queries.UpdateConnectorStatus(ctx, s.pool, c)
+}
+
+// needsReconnect records that c's sign-in stopped working and returns what
+// the model is told.
+func (s *ConnectorService) needsReconnect(c *models.Connector) string {
+	s.markNeedsAuth(c)
+	return strings.ToUpper(c.Name[:1]) + c.Name[1:] + " needs reconnecting in Connectors"
+}
+
+func (s *ConnectorService) markNeedsAuth(c *models.Connector) {
+	c.Status, c.Error = models.ConnectorNeedsAuth, nil
+	if err := queries.UpdateConnectorStatus(context.Background(), s.pool, c); err != nil {
+		log.Printf("connector %s: %v", c.Name, err)
+	}
 }
 
 // connect opens a session to c and lists its tools, recording the outcome
@@ -308,8 +493,14 @@ func (s *ConnectorService) tokenSource(ctx context.Context, c *models.Connector)
 	if errors.Is(err, queries.ErrNotFound) {
 		return nil, nil
 	}
-	if err != nil || cred.AccessToken == "" {
+	if err != nil {
 		return nil, err
+	}
+	if err := s.unseal(cred); err != nil {
+		return nil, err
+	}
+	if cred.AccessToken == "" {
+		return nil, nil
 	}
 	tok := &oauth2.Token{AccessToken: cred.AccessToken, RefreshToken: cred.RefreshToken, TokenType: cred.TokenType}
 	if cred.Expiry != nil {
@@ -330,7 +521,26 @@ func (s *ConnectorService) saveToken(ctx context.Context, c *models.Connector, t
 		e := t.Expiry.UTC()
 		expiry = &e
 	}
-	return queries.SaveOAuthToken(ctx, s.pool, c.ID, t.AccessToken, t.RefreshToken, t.TokenType, expiry)
+	access, err := s.box.Seal(t.AccessToken)
+	if err != nil {
+		return err
+	}
+	refresh, err := s.box.Seal(t.RefreshToken)
+	if err != nil {
+		return err
+	}
+	return queries.SaveOAuthToken(ctx, s.pool, c.ID, access, refresh, t.TokenType, expiry)
+}
+
+// unseal decrypts cred's secrets in place; plaintext rows from before
+// encryption pass through and are sealed by their next save.
+func (s *ConnectorService) unseal(cred *models.OAuthCredential) (err error) {
+	for _, f := range []*string{&cred.AccessToken, &cred.RefreshToken, &cred.ClientSecret} {
+		if *f, err = s.box.Open(*f); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *ConnectorService) oauthConfig(cred *models.OAuthCredential) *oauth2.Config {
