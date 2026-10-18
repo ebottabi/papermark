@@ -36,7 +36,7 @@ func TestRoutineRunsFollowTheirSavedSkills(t *testing.T) {
 		t.Fatal(err)
 	}
 	if task, _ := queries.GetTask(ctx, testPool, uuid.MustParse(first)); task != nil {
-		if _, _, err := s.Tasks.Prepare(ctx, task); err != nil {
+		if _, _, err := s.Harness.Preparer.Prepare(ctx, task); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -59,7 +59,7 @@ func TestRoutineRunsFollowTheirSavedSkills(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	text, picked, err := s.Tasks.Prepare(ctx, task)
+	text, picked, err := s.Harness.Preparer.Prepare(ctx, task)
 	if err != nil {
 		t.Fatal(err)
 	}

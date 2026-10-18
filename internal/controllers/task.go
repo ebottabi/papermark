@@ -332,6 +332,11 @@ func (h *TaskController) Events(c *fiber.Ctx) error {
 		if refill() != nil {
 			return
 		}
+		// The replay is done, so a client can now tell a finished task from one it has only part of.
+		_, _ = io.WriteString(w, "event: ready\ndata: {}\n\n")
+		if w.Flush() != nil {
+			return
+		}
 		for {
 			select {
 			case f, ok := <-frames:
@@ -356,6 +361,10 @@ func (h *TaskController) Events(c *fiber.Ctx) error {
 					}
 				}
 			case <-ping.C:
+				// The bus drops frames for a slow reader; a gap is otherwise only noticed at the next event.
+				if refill() != nil {
+					return
+				}
 				_, _ = io.WriteString(w, ": ping\n\n")
 			}
 			if w.Flush() != nil {
