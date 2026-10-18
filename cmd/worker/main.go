@@ -60,6 +60,7 @@ func main() {
 		cancel()
 	}()
 	go workers.RunScheduler(workerCtx, svcs.Schedules, workers.SchedulerInterval)
+	go workers.RunTriggers(workerCtx, svcs.Triggers, workers.TriggerInterval)
 
 	log.Println("Worker ready, consuming jobs...")
 	if err := worker.Run(workerCtx); err != nil && err != context.Canceled {

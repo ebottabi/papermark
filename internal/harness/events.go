@@ -11,8 +11,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strings"
 
 	"papermark/internal/cache"
+	"papermark/internal/harness/tools"
 	"papermark/internal/models"
 	"papermark/internal/models/queries"
 
@@ -49,15 +51,8 @@ type (
 		Text        string   `json:"text"`
 		Attachments []string `json:"attachments"`
 	}
-	UpdateEvent struct { // publish_update; importance is what the server applied
-		Type       string           `json:"type"`
-		ID         string           `json:"id"`
-		Importance string           `json:"importance"`
-		Title      string           `json:"title"`
-		Body       string           `json:"body"`
-		Sections   []models.Section `json:"sections"`
-	}
-	IdleEvent struct {
+	UpdateEvent = tools.UpdateEvent // publish_update emits it
+	IdleEvent   struct {
 		Type  string   `json:"type"`
 		Text  string   `json:"text"`
 		Files []string `json:"files"`
@@ -83,7 +78,10 @@ type Emit func(event any) error
 type emitted struct {
 	seq  int
 	raw  json.RawMessage
-	head struct{ Type, Text, Name, Importance, Title string }
+	head struct {
+		Type, Text, Name, Importance, Title string
+		Input                               json.RawMessage
+	}
 }
 
 // TaskTx runs fn in a transaction that holds the task's row lock. Events
@@ -144,7 +142,7 @@ func (h *Harness) tx(ctx context.Context, db Beginner, taskID uuid.UUID, load fu
 			text := em.head.Text
 			switch em.head.Type {
 			case "confirm":
-				text = em.head.Name
+				text = confirmAlert(em.head.Name, em.head.Input)
 			case "update":
 				text = em.head.Title
 			}
@@ -183,4 +181,48 @@ func settleRoutine(ctx context.Context, tx pgx.Tx, task *models.Task, out []emit
 		}
 	}
 	return nil
+}
+
+// confirmVerbs says what an approval is for in a push, which has no room for the card.
+var confirmVerbs = map[string]string{
+	"gmail_send":            "Send an email",
+	"gmail_send_draft":      "Send a draft",
+	"gmail_forward":         "Forward an email",
+	"gmail_trash":           "Move email to Trash",
+	"calendar_create_event": "Add an event",
+	"calendar_update_event": "Change an event",
+	"calendar_delete_event": "Delete an event",
+	"calendar_respond":      "Reply to an invite",
+	"routine_create":        "Create a routine",
+}
+
+// confirmAlert is an approval's push text: "Approve: Send an email · to ana@x.com".
+func confirmAlert(name string, input json.RawMessage) string {
+	verb, ok := confirmVerbs[name]
+	if !ok {
+		verb = strings.ReplaceAll(name, "_", " ")
+	}
+	var fields map[string]any
+	json.Unmarshal(input, &fields)
+	detail := ""
+	for _, k := range []string{"to", "summary", "title", "subject"} {
+		switch v := fields[k].(type) {
+		case string:
+			detail = v
+		case []any:
+			if len(v) > 0 {
+				detail, _ = v[0].(string)
+				if len(v) > 1 {
+					detail += fmt.Sprintf(" +%d", len(v)-1)
+				}
+			}
+		}
+		if detail != "" {
+			if k == "to" {
+				detail = "to " + detail
+			}
+			return "Approve: " + verb + " · " + detail
+		}
+	}
+	return "Approve: " + verb
 }

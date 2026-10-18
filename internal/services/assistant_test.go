@@ -116,7 +116,7 @@ func TestUpdatesPaginateNewestFirstAndStayScopedToTheUser(t *testing.T) {
 		return tk.ID
 	}
 	add := func(user uuid.UUID, importance, title string) *models.Update {
-		up := &models.Update{UserID: user, TaskID: task(user), Importance: importance, Title: title, Sections: []models.Section{}}
+		up := &models.Update{UserID: user, TaskID: taskPtr(task(user)), Importance: importance, Title: title, Sections: []models.Section{}}
 		if err := queries.InsertUpdate(ctx, pool, up); err != nil {
 			t.Fatal(err)
 		}
@@ -249,3 +249,5 @@ func TestFirstMessageCarriesRelevantMemories(t *testing.T) {
 		t.Fatalf("%q %v", got, err)
 	}
 }
+
+func taskPtr(id uuid.UUID) *uuid.UUID { return &id }

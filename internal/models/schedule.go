@@ -52,6 +52,9 @@ type Schedule struct {
 	LimitNotedAt *time.Time `json:"-"`
 	// Runs in a row that ended in error; any success or edit resets it.
 	ConsecutiveFailures int `gorm:"not null;default:0" json:"-"`
+	// Skills are the names its runs follow, picked at the first run after the
+	// prompt was set; nil until then. The column is added in PostMigrations.
+	Skills []string `gorm:"-" json:"-"`
 }
 
 // TableName for GORM.

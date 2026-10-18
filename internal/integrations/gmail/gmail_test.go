@@ -287,6 +287,14 @@ func TestSendReplyBuildsThreadedMessage(t *testing.T) {
 	if _, err := tool(t, one(c, &memCursor{}), "send").Run(context.Background(), ws, json.RawMessage(`{"to":["a@x.com"],"body":"x","attachments":["../../etc/passwd"]}`)); err == nil {
 		t.Fatal("attachment outside the workspace accepted")
 	}
+	outside := filepath.Join(t.TempDir(), "secret.txt")
+	os.WriteFile(outside, []byte("secret"), 0o644)
+	if err := os.Symlink(outside, filepath.Join(ws, "link.txt")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tool(t, one(c, &memCursor{}), "send").Run(context.Background(), ws, json.RawMessage(`{"to":["a@x.com"],"body":"x","attachments":["link.txt"]}`)); err == nil || !strings.Contains(err.Error(), "escapes") {
+		t.Fatalf("symlink out of the workspace accepted: %v", err)
+	}
 }
 
 func TestDigestSinceLastAdvancesCursorAndFallsBackWhenExpired(t *testing.T) {

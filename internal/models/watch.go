@@ -42,7 +42,7 @@ type WatchTarget struct {
 	Selector        string     `gorm:"type:text;not null;default:''"`
 	Fingerprint     string     `gorm:"type:varchar(64);not null;default:''"`
 	LastValue       string     `gorm:"type:text;not null;default:''"`
-	ETag            string     `gorm:"type:text;not null;default:''"`
+	ETag            string     `gorm:"column:etag;type:text;not null;default:''"`
 	LastModified    string     `gorm:"type:text;not null;default:''"`
 	NextCheckAt     time.Time  `gorm:"not null;index"`
 	LockedUntil     *time.Time `gorm:""`

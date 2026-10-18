@@ -26,6 +26,8 @@ import (
 
 	"papermark/internal/config"
 	"papermark/internal/harness"
+	"papermark/internal/integrations/gcal"
+	"papermark/internal/integrations/gdrive"
 	"papermark/internal/integrations/gmail"
 	"papermark/internal/integrations/mcp"
 	"papermark/internal/models"
@@ -33,9 +35,12 @@ import (
 	"papermark/internal/secretbox"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/oauth2"
 )
+
+const gmailName = "gmail"
 
 const (
 	connectTimeout = 20 * time.Second
@@ -44,6 +49,10 @@ const (
 
 // ErrInvalidConnector wraps connector validation failures.
 var ErrInvalidConnector = errors.New("invalid connector")
+
+// ErrDifferentAccount is returned by Callback when a reconnect was signed in
+// with another address than the account being reconnected.
+var ErrDifferentAccount = errors.New("signed in as a different account")
 
 // ErrInvalidOAuthState is returned by Callback for an unknown, used or expired state.
 var ErrInvalidOAuthState = errors.New("invalid or expired oauth state")
@@ -92,6 +101,13 @@ func (s *ConnectorService) List(ctx context.Context, user uuid.UUID) ([]*models.
 	added := map[string]bool{}
 	for _, c := range cs {
 		added[c.Name] = true
+		if models.HasAccounts(c.Kind) {
+			accounts, err := queries.ListGmailAccounts(ctx, s.pool, c.ID)
+			if err != nil {
+				return nil, err
+			}
+			applyAccounts(c, accounts)
+		}
 	}
 	names := make([]string, 0, len(s.catalog))
 	for name := range s.catalog {
@@ -131,8 +147,9 @@ func (s *ConnectorService) Add(ctx context.Context, user uuid.UUID, name, rawURL
 	return c, nil
 }
 
-// Delete removes a connector and its OAuth client and tokens. A gmail
-// connector's token is revoked at Google first, on a best-effort basis.
+// Delete removes a connector and its OAuth client and tokens. A Google
+// connector's accounts are revoked at Google first, on a best-effort basis,
+// and a contacts account's stored contacts are deleted.
 func (s *ConnectorService) Delete(ctx context.Context, user uuid.UUID, name string) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -143,8 +160,20 @@ func (s *ConnectorService) Delete(ctx context.Context, user uuid.UUID, name stri
 	if err != nil {
 		return err
 	}
-	if c.Kind == models.ConnectorGmail {
-		s.revoke(ctx, c)
+	if models.HasAccounts(c.Kind) {
+		accounts, err := queries.ListGmailAccounts(ctx, tx, c.ID)
+		if err != nil {
+			return err
+		}
+		for _, a := range accounts {
+			s.revokeAccount(ctx, c, a)
+			if err := queries.DeleteAccountContacts(ctx, tx, a.ID); err != nil {
+				return err
+			}
+		}
+		if err := queries.DeleteConnectorGmailAccounts(ctx, tx, c.ID); err != nil {
+			return err
+		}
 	}
 	if err := queries.SoftDeleteConnector(ctx, tx, c.ID); err != nil {
 		return err
@@ -152,13 +181,23 @@ func (s *ConnectorService) Delete(ctx context.Context, user uuid.UUID, name stri
 	if err := queries.DeleteOAuthCredential(ctx, tx, c.ID); err != nil {
 		return err
 	}
+	if c.Kind == models.ConnectorGmail {
+		if err := syncMailboxPolls(ctx, tx, user); err != nil {
+			return err
+		}
+	}
 	return tx.Commit(ctx)
 }
 
-// revoke asks Google to invalidate c's token. Failures are logged and ignored:
-// the connector is deleted either way.
-func (s *ConnectorService) revoke(ctx context.Context, c *models.Connector) {
-	cred, err := queries.GetOAuthCredential(ctx, s.pool, c.ID)
+// revokeAccount asks Google to invalidate an account's token. Failures are
+// logged and ignored: the account is removed either way. Google revokes the
+// whole grant of the OAuth client, so an address still signed in to the
+// other Google connector keeps its grant and only loses this token locally.
+func (s *ConnectorService) revokeAccount(ctx context.Context, c *models.Connector, a *models.GmailAccount) {
+	if shared, err := queries.AccountEmailElsewhere(ctx, s.pool, a.UserID, c.ID, a.Email); err != nil || shared {
+		return
+	}
+	cred, err := queries.GetAccountOAuthCredential(ctx, s.pool, a.ID)
 	if err != nil {
 		return
 	}
@@ -192,22 +231,129 @@ func (s *ConnectorService) revoke(ctx context.Context, c *models.Connector) {
 	}
 }
 
-// Authorize discovers the connector's authorization server (a gmail
-// connector uses Google's endpoints from the catalog), registers a
+// account returns one of user's accounts and its connector, ErrNotFound
+// unless the connector is of kind.
+func (s *ConnectorService) account(ctx context.Context, user uuid.UUID, kind string, id uuid.UUID) (*models.GmailAccount, *models.Connector, error) {
+	a, err := queries.GetGmailAccount(ctx, s.pool, user, id)
+	if err != nil {
+		return nil, nil, err
+	}
+	c, err := queries.GetConnector(ctx, s.pool, a.ConnectorID)
+	if err != nil {
+		return nil, nil, err
+	}
+	if c.Kind != kind {
+		return nil, nil, queries.ErrNotFound
+	}
+	return a, c, nil
+}
+
+// DeleteAccount removes one account of a Google connector of kind
+// after revoking its token. Removing the primary promotes the oldest
+// remaining account; removing the last one removes the connector.
+func (s *ConnectorService) DeleteAccount(ctx context.Context, user uuid.UUID, kind string, id uuid.UUID) error {
+	a, c, err := s.account(ctx, user, kind, id)
+	if err != nil {
+		return err
+	}
+	s.revokeAccount(ctx, c, a)
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if err := queries.DeleteAccountOAuthCredential(ctx, tx, a.ID); err != nil {
+		return err
+	}
+	if err := queries.DeleteAccountContacts(ctx, tx, a.ID); err != nil {
+		return err
+	}
+	if err := queries.DeleteGmailAccount(ctx, tx, a.ID); err != nil {
+		return err
+	}
+	rest, err := queries.ListGmailAccounts(ctx, tx, c.ID)
+	if err != nil {
+		return err
+	}
+	if len(rest) == 0 {
+		if err := queries.SoftDeleteConnector(ctx, tx, c.ID); err != nil {
+			return err
+		}
+		if err := queries.DeleteOAuthCredential(ctx, tx, c.ID); err != nil {
+			return err
+		}
+	} else {
+		if a.Primary {
+			if err := queries.SetPrimaryGmailAccount(ctx, tx, c.ID, rest[0].ID); err != nil {
+				return err
+			}
+		}
+		if err := s.refreshAccounts(ctx, tx, c); err != nil {
+			return err
+		}
+	}
+	if err := syncMailboxPolls(ctx, tx, user); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// SetPrimary makes id the account Keen uses by default (sends from, or
+// creates events in) on its connector of kind.
+func (s *ConnectorService) SetPrimary(ctx context.Context, user uuid.UUID, kind string, id uuid.UUID) error {
+	a, c, err := s.account(ctx, user, kind, id)
+	if err != nil {
+		return err
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if err := queries.SetPrimaryGmailAccount(ctx, tx, c.ID, a.ID); err != nil {
+		return err
+	}
+	if err := s.refreshAccounts(ctx, tx, c); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// Authorize discovers the connector's authorization server (gmail and
+// calendar use Google's endpoints from the catalog), registers a
 // client unless the catalog supplies one, and returns the URL the user opens
-// to grant access (PKCE S256). A catalog connector is added on first use.
+// to grant access (PKCE S256). A catalog connector is added on first use, and
+// authorizing gmail or calendar again adds another account.
 func (s *ConnectorService) Authorize(ctx context.Context, user uuid.UUID, name string) (string, error) {
 	entry, inCatalog := s.catalog[name]
 	c, err := queries.GetConnectorByName(ctx, s.pool, user, name)
 	if errors.Is(err, queries.ErrNotFound) && inCatalog && entry.URL != "" {
 		c = &models.Connector{UserID: user, Name: name, Kind: s.kind(name), URL: entry.URL, Status: models.ConnectorNeedsAuth}
 		err = queries.CreateConnector(ctx, s.pool, c)
+		if errors.Is(err, queries.ErrConflict) { // a concurrent first authorize created it
+			c, err = queries.GetConnectorByName(ctx, s.pool, user, name)
+		}
 	}
 	if err != nil {
 		return "", err
 	}
+	return s.authorize(ctx, c, entry, nil)
+}
+
+// AuthorizeAccount returns the URL that reconnects one account of a gmail or calendar connector (kind).
+func (s *ConnectorService) AuthorizeAccount(ctx context.Context, user uuid.UUID, kind string, id uuid.UUID) (string, error) {
+	a, c, err := s.account(ctx, user, kind, id)
+	if err != nil {
+		return "", err
+	}
+	return s.authorize(ctx, c, s.catalog[c.Name], &a.ID)
+}
+
+// authorize stores a pending authorization for c, or for one of its accounts.
+func (s *ConnectorService) authorize(ctx context.Context, c *models.Connector, entry config.ConnectorConfig, account *uuid.UUID) (string, error) {
 	var as *mcp.AuthServer
-	if c.Kind == models.ConnectorGmail {
+	var err error
+	if models.HasAccounts(c.Kind) {
 		as = &mcp.AuthServer{AuthURL: entry.AuthURL, TokenURL: entry.TokenURL}
 	} else if as, err = mcp.Discover(ctx, c.URL, s.http); err != nil {
 		return "", fmt.Errorf("discover authorization server: %w", err)
@@ -216,8 +362,8 @@ func (s *ConnectorService) Authorize(ctx context.Context, user uuid.UUID, name s
 		as.Scopes = entry.Scopes
 	}
 	clientID, secret := entry.ClientID, entry.ClientSecret
-	if clientID == "" && c.Kind == models.ConnectorGmail {
-		return "", errors.New("gmail: no OAuth client is configured (GMAIL_CLIENT_ID)")
+	if clientID == "" && models.HasAccounts(c.Kind) {
+		return "", fmt.Errorf("%s: no OAuth client is configured (%s_CLIENT_ID)", c.Name, strings.ToUpper(c.Kind))
 	}
 	if clientID == "" {
 		if clientID, secret, err = mcp.Register(ctx, as, s.redirectURI, s.http); err != nil {
@@ -235,7 +381,7 @@ func (s *ConnectorService) Authorize(ctx context.Context, user uuid.UUID, name s
 	state := base64.RawURLEncoding.EncodeToString(raw)
 	expires := time.Now().Add(oauthStateTTL).UTC()
 	cred := &models.OAuthCredential{
-		UserID: c.UserID, ConnectorID: c.ID, Resource: as.Resource, AuthURL: as.AuthURL, TokenURL: as.TokenURL,
+		UserID: c.UserID, ConnectorID: c.ID, AccountID: account, Resource: as.Resource, AuthURL: as.AuthURL, TokenURL: as.TokenURL,
 		Scopes: strings.Join(as.Scopes, " "), ClientID: clientID, ClientSecret: sealedSecret,
 		Verifier: oauth2.GenerateVerifier(), StateHash: hashState(state), StateExpiresAt: &expires,
 	}
@@ -255,27 +401,28 @@ func (s *ConnectorService) Authorize(ctx context.Context, user uuid.UUID, name s
 // Callback completes an authorization: it consumes state (single use,
 // expiring, bound to the user who started it through the connector's
 // credential row), exchanges code for tokens and reconnects. It returns the
-// connector whenever state matched one, even when a later step failed.
-func (s *ConnectorService) Callback(ctx context.Context, state, code, oauthError string) (*models.Connector, error) {
+// connector whenever state matched one, even when a later step failed, and
+// for gmail and calendar the address that signed in.
+func (s *ConnectorService) Callback(ctx context.Context, state, code, oauthError string) (*models.Connector, string, error) {
 	if state == "" {
-		return nil, ErrInvalidOAuthState
+		return nil, "", ErrInvalidOAuthState
 	}
 	cred, err := queries.ConsumeOAuthState(ctx, s.pool, hashState(state), time.Now())
 	if errors.Is(err, queries.ErrNotFound) {
-		return nil, ErrInvalidOAuthState
+		return nil, "", ErrInvalidOAuthState
 	}
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	c, err := queries.GetConnector(ctx, s.pool, cred.ConnectorID)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if oauthError != "" || code == "" {
-		return c, fmt.Errorf("authorization denied: %q", oauthError)
+		return c, "", fmt.Errorf("authorization denied: %q", oauthError)
 	}
 	if err := s.unseal(cred); err != nil {
-		return c, err
+		return c, "", err
 	}
 	opts := []oauth2.AuthCodeOption{oauth2.VerifierOption(cred.Verifier)}
 	if cred.Resource != "" {
@@ -283,20 +430,21 @@ func (s *ConnectorService) Callback(ctx context.Context, state, code, oauthError
 	}
 	tok, err := s.oauthConfig(cred).Exchange(context.WithValue(ctx, oauth2.HTTPClient, s.http), code, opts...)
 	if err != nil {
-		return c, fmt.Errorf("token exchange: %w", err)
+		return c, "", fmt.Errorf("token exchange: %w", err)
+	}
+	if models.HasAccounts(c.Kind) {
+		email, err := s.connectAccount(ctx, c, cred, tok)
+		return c, email, err
 	}
 	if err := s.saveToken(ctx, c, tok); err != nil {
-		return c, err
-	}
-	if c.Kind == models.ConnectorGmail {
-		return c, s.connectGmail(ctx, c)
+		return c, "", err
 	}
 	sess, _, err := s.connect(ctx, c)
 	if err != nil {
-		return c, err
+		return c, "", err
 	}
 	sess.Close()
-	return c, nil
+	return c, "", nil
 }
 
 // Snapshot connects to every one of the user's connectors and returns their tools for one task,
@@ -308,7 +456,7 @@ func (s *ConnectorService) Snapshot(ctx context.Context, userID uuid.UUID) (*har
 	if err != nil {
 		return nil, err
 	}
-	set := &harness.ConnectorToolset{Handlers: map[string]harness.ConnectorHandler{}, NeedsApproval: map[string]bool{}, NoAlways: map[string]bool{}}
+	set := &harness.ConnectorToolset{Handlers: map[string]harness.ConnectorHandler{}, NeedsApproval: map[string]bool{}, NoAlways: map[string]bool{}, Resolve: map[string]func(json.RawMessage) (json.RawMessage, error){}}
 	var sessions []*mcp.Session
 	set.Close = func() {
 		for _, sess := range sessions {
@@ -316,8 +464,18 @@ func (s *ConnectorService) Snapshot(ctx context.Context, userID uuid.UUID) (*har
 		}
 	}
 	for _, c := range cs {
-		if c.Kind == models.ConnectorGmail {
+		switch c.Kind {
+		case models.ConnectorGmail:
 			s.addGmail(ctx, set, c)
+			continue
+		case models.ConnectorCalendar:
+			s.addCalendar(ctx, set, c)
+			continue
+		case models.ConnectorContacts:
+			s.addContacts(ctx, set, c)
+			continue
+		case models.ConnectorDrive:
+			s.addDrive(ctx, set, c)
 			continue
 		}
 		sess, tools, err := s.connect(ctx, c)
@@ -348,89 +506,431 @@ func (s *ConnectorService) Snapshot(ctx context.Context, userID uuid.UUID) (*har
 	return set, nil
 }
 
-// addGmail adds c's Gmail tools to set. A connector without a usable sign-in
-// is skipped, as a failed MCP connection is.
+// addGmail adds one set of Gmail tools over c's connected accounts. An
+// account without a usable sign-in is marked needs_auth and left out, as a
+// failed MCP connection is.
 func (s *ConnectorService) addGmail(ctx context.Context, set *harness.ConnectorToolset, c *models.Connector) {
-	if c.Status == models.ConnectorNeedsAuth {
-		return
-	}
-	ts, err := s.tokenSource(ctx, c)
+	rows, err := queries.ListGmailAccounts(ctx, s.pool, c.ID)
 	if err != nil {
 		log.Printf("connector %s: %v", c.Name, err)
 		return
 	}
-	if ts == nil {
-		s.markNeedsAuth(c)
-		return
+	var accounts []gmail.Account
+	for _, a := range rows {
+		if a.Status != models.ConnectorConnected {
+			continue
+		}
+		ts, err := s.accountTokenSource(ctx, a)
+		if err != nil {
+			log.Printf("connector %s: %v", c.Name, err)
+			continue
+		}
+		if ts == nil {
+			s.markAccountNeedsAuth(a.ID)
+			continue
+		}
+		accounts = append(accounts, gmail.Account{Email: a.Email, Primary: a.Primary, Client: s.gmailClient(c.Name, ts, 30*time.Second), Cursor: accountCursor{s.pool, a.ID}})
 	}
-	base := s.http.Transport
-	client := &gmail.Client{
-		HTTP:    &http.Client{Transport: &oauth2.Transport{Source: ts, Base: base}, Timeout: 30 * time.Second},
-		BaseURL: s.catalog[c.Name].URL,
+	byEmail := map[string]uuid.UUID{}
+	for _, a := range rows {
+		byEmail[strings.ToLower(a.Email)] = a.ID
 	}
-	for _, t := range gmail.Tools(client, historyCursor{s.pool, c}) {
+	onAuth := func(email string) { s.markAccountNeedsAuth(byEmail[strings.ToLower(email)]) }
+	for _, t := range gmail.Tools(accounts, onAuth) {
 		name := mcp.ToolName(c.Name, t.Name)
 		set.Tools = append(set.Tools, harness.ConnectorTool{Name: name, Description: "[" + c.Name + "] " + t.Description, InputSchema: t.Schema})
 		run := t.Run
 		set.Handlers[name] = func(ctx context.Context, input json.RawMessage) (string, bool, error) {
 			text, err := run(ctx, harness.WorkspaceFrom(ctx), input)
 			if errors.Is(err, gmail.ErrNeedsAuth) {
-				return s.needsReconnect(c), true, nil
+				return err.Error(), true, nil
 			}
 			return text, false, err
 		}
 		set.NeedsApproval[name] = t.Approval
 		set.NoAlways[name] = t.NoAlways
+		if t.Resolve != nil {
+			set.Resolve[name] = t.Resolve
+		}
 	}
 }
 
-// historyCursor keeps a gmail connector's digest position in its row.
-type historyCursor struct {
-	pool *pgxpool.Pool
-	c    *models.Connector
+// addCalendar adds one set of Calendar tools over c's connected accounts, as
+// addGmail does. New events default to the user's preferred time zone.
+func (s *ConnectorService) addCalendar(ctx context.Context, set *harness.ConnectorToolset, c *models.Connector) {
+	rows, err := queries.ListGmailAccounts(ctx, s.pool, c.ID)
+	if err != nil {
+		log.Printf("connector %s: %v", c.Name, err)
+		return
+	}
+	tz := ""
+	if prefs, err := queries.GetPreferences(ctx, s.pool, c.UserID); err == nil {
+		tz = prefs.Timezone
+	}
+	var accounts []gcal.Account
+	byEmail := map[string]uuid.UUID{}
+	for _, a := range rows {
+		byEmail[strings.ToLower(a.Email)] = a.ID
+		if a.Status != models.ConnectorConnected {
+			continue
+		}
+		ts, err := s.accountTokenSource(ctx, a)
+		if err != nil {
+			log.Printf("connector %s: %v", c.Name, err)
+			continue
+		}
+		if ts == nil {
+			s.markAccountNeedsAuth(a.ID)
+			continue
+		}
+		accounts = append(accounts, gcal.Account{Email: a.Email, Primary: a.Primary, Client: s.calendarClient(c.Name, ts, 30*time.Second)})
+	}
+	onAuth := func(email string) { s.markAccountNeedsAuth(byEmail[strings.ToLower(email)]) }
+	for _, t := range gcal.Tools(accounts, tz, onAuth) {
+		name := mcp.ToolName(c.Name, t.Name)
+		set.Tools = append(set.Tools, harness.ConnectorTool{Name: name, Description: "[" + c.Name + "] " + t.Description, InputSchema: t.Schema})
+		run := t.Run
+		set.Handlers[name] = func(ctx context.Context, input json.RawMessage) (string, bool, error) {
+			text, err := run(ctx, input)
+			if errors.Is(err, gcal.ErrNeedsAuth) {
+				return err.Error(), true, nil
+			}
+			return text, false, err
+		}
+		set.NeedsApproval[name] = t.Approval
+		if t.Resolve != nil {
+			set.Resolve[name] = t.Resolve
+		}
+	}
 }
 
-func (h historyCursor) Get(ctx context.Context) (string, error) {
-	c, err := queries.GetConnector(ctx, h.pool, h.c.ID)
+// connectedAccounts returns c's connected accounts with a token source. An
+// account without a usable sign-in is marked needs_auth and left out. byEmail
+// maps every account's lowercased address to its id.
+func (s *ConnectorService) connectedAccounts(ctx context.Context, c *models.Connector) (accounts []*models.GmailAccount, sources []oauth2.TokenSource, byEmail map[string]uuid.UUID) {
+	rows, err := queries.ListGmailAccounts(ctx, s.pool, c.ID)
+	if err != nil {
+		log.Printf("connector %s: %v", c.Name, err)
+		return nil, nil, nil
+	}
+	byEmail = map[string]uuid.UUID{}
+	for _, a := range rows {
+		byEmail[strings.ToLower(a.Email)] = a.ID
+		if a.Status != models.ConnectorConnected {
+			continue
+		}
+		ts, err := s.accountTokenSource(ctx, a)
+		if err != nil {
+			log.Printf("connector %s: %v", c.Name, err)
+			continue
+		}
+		if ts == nil {
+			s.markAccountNeedsAuth(a.ID)
+			continue
+		}
+		accounts, sources = append(accounts, a), append(sources, ts)
+	}
+	return accounts, sources, byEmail
+}
+
+// addContacts adds the read-only contacts tools over the stored copies of
+// c's connected accounts' contacts.
+func (s *ConnectorService) addContacts(ctx context.Context, set *harness.ConnectorToolset, c *models.Connector) {
+	rows, _, _ := s.connectedAccounts(ctx, c)
+	accounts := make([]contactAccount, len(rows))
+	for i, a := range rows {
+		accounts[i] = contactAccount{a.ID, a.Email}
+	}
+	for _, t := range contactTools(s.pool, c.UserID, accounts) {
+		name := mcp.ToolName(c.Name, t.Name)
+		set.Tools = append(set.Tools, harness.ConnectorTool{Name: name, Description: "[" + c.Name + "] " + t.Description, InputSchema: t.Schema})
+		run := t.Run
+		set.Handlers[name] = func(ctx context.Context, input json.RawMessage) (string, bool, error) {
+			text, err := run(ctx, input)
+			return text, false, err
+		}
+	}
+}
+
+// addDrive adds the read-only Drive tools over c's connected accounts.
+func (s *ConnectorService) addDrive(ctx context.Context, set *harness.ConnectorToolset, c *models.Connector) {
+	rows, sources, byEmail := s.connectedAccounts(ctx, c)
+	accounts := make([]gdrive.Account, len(rows))
+	for i, a := range rows {
+		accounts[i] = gdrive.Account{Email: a.Email, Primary: a.Primary, Client: s.driveClient(c.Name, sources[i], 60*time.Second)}
+	}
+	onAuth := func(email string) { s.markAccountNeedsAuth(byEmail[strings.ToLower(email)]) }
+	for _, t := range gdrive.Tools(accounts, onAuth) {
+		name := mcp.ToolName(c.Name, t.Name)
+		set.Tools = append(set.Tools, harness.ConnectorTool{Name: name, Description: "[" + c.Name + "] " + t.Description, InputSchema: t.Schema})
+		run := t.Run
+		set.Handlers[name] = func(ctx context.Context, input json.RawMessage) (string, bool, error) {
+			text, err := run(ctx, harness.WorkspaceFrom(ctx), input)
+			if errors.Is(err, gdrive.ErrNeedsAuth) {
+				return err.Error(), true, nil
+			}
+			return text, false, err
+		}
+	}
+}
+
+func (s *ConnectorService) driveClient(name string, ts oauth2.TokenSource, timeout time.Duration) *gdrive.Client {
+	return &gdrive.Client{
+		HTTP:    &http.Client{Transport: &oauth2.Transport{Source: ts, Base: s.http.Transport}, Timeout: timeout},
+		BaseURL: s.catalog[name].URL,
+	}
+}
+
+func (s *ConnectorService) calendarClient(name string, ts oauth2.TokenSource, timeout time.Duration) *gcal.Client {
+	return &gcal.Client{
+		HTTP:    &http.Client{Transport: &oauth2.Transport{Source: ts, Base: s.http.Transport}, Timeout: timeout},
+		BaseURL: s.catalog[name].URL,
+	}
+}
+
+// MailClient returns a Gmail client for an account's stored sign-in, or
+// gmail.ErrNeedsAuth when it has none.
+func (s *ConnectorService) MailClient(ctx context.Context, a *models.GmailAccount) (*gmail.Client, error) {
+	ts, err := s.accountTokenSource(ctx, a)
+	if err != nil {
+		return nil, err
+	}
+	if ts == nil {
+		return nil, gmail.ErrNeedsAuth
+	}
+	return s.gmailClient(gmailName, ts, 30*time.Second), nil
+}
+
+// accountCursor keeps a gmail account's digest position in its row.
+type accountCursor struct {
+	pool *pgxpool.Pool
+	id   uuid.UUID
+}
+
+func (h accountCursor) Get(ctx context.Context) (string, error) {
+	a, err := queries.GetGmailAccountByID(ctx, h.pool, h.id)
 	if err != nil {
 		return "", err
 	}
-	return c.HistoryID, nil
+	return a.HistoryID, nil
 }
 
-func (h historyCursor) Set(ctx context.Context, id string) error {
-	return queries.UpdateConnectorHistory(ctx, h.pool, h.c.ID, id)
+func (h accountCursor) Set(ctx context.Context, id string) error {
+	return queries.UpdateGmailAccountHistory(ctx, h.pool, h.id, id)
 }
 
-// connectGmail checks the stored sign-in against Google, records the mailbox
-// address and the history position digests start from, and marks c connected.
-func (s *ConnectorService) connectGmail(ctx context.Context, c *models.Connector) error {
-	ts, err := s.tokenSource(ctx, c)
-	if err != nil || ts == nil {
-		return fmt.Errorf("gmail: no usable token: %v", err)
+func (s *ConnectorService) gmailClient(name string, ts oauth2.TokenSource, timeout time.Duration) *gmail.Client {
+	return &gmail.Client{
+		HTTP:    &http.Client{Transport: &oauth2.Transport{Source: ts, Base: s.http.Transport}, Timeout: timeout},
+		BaseURL: s.catalog[name].URL,
 	}
-	client := &gmail.Client{
-		HTTP:    &http.Client{Transport: &oauth2.Transport{Source: ts, Base: s.http.Transport}, Timeout: connectTimeout},
-		BaseURL: s.catalog[c.Name].URL,
+}
+
+// identify checks tokens just granted to a Google connector
+// against Google and returns the address that signed in, plus a gmail
+// mailbox's current history id.
+func (s *ConnectorService) identify(ctx context.Context, c *models.Connector, tok *oauth2.Token) (email, historyID string, err error) {
+	ts := oauth2.StaticTokenSource(tok)
+	switch c.Kind {
+	case models.ConnectorContacts:
+		email, err := s.contactsClient(c.Name, ts, connectTimeout).Me(ctx)
+		return email, "", err
+	case models.ConnectorDrive:
+		email, err := s.driveClient(c.Name, ts, connectTimeout).About(ctx)
+		return email, "", err
 	}
-	prof, err := client.Profile(ctx)
+	if c.Kind == models.ConnectorCalendar {
+		cal, err := s.calendarClient(c.Name, ts, connectTimeout).PrimaryCalendar(ctx)
+		if err != nil {
+			return "", "", err
+		}
+		if !strings.Contains(cal.ID, "@") {
+			return "", "", fmt.Errorf("calendar: primary calendar %q is not an address", cal.ID)
+		}
+		return cal.ID, "", nil
+	}
+	prof, err := s.gmailClient(c.Name, ts, connectTimeout).Profile(ctx)
 	if err != nil {
-		msg := err.Error()
-		c.Status, c.Error = models.ConnectorError, &msg
-		if errors.Is(err, gmail.ErrNeedsAuth) {
-			c.Status, c.Error = models.ConnectorNeedsAuth, nil
+		return "", "", err
+	}
+	return prof.Email, prof.HistoryID, nil
+}
+
+// connectAccount checks the tokens just granted against Google, then either
+// reconnects the account the authorization was for, reconnects the account
+// already holding the address that signed in, or adds a new account. It
+// returns the address that signed in. Reconnecting as another address leaves
+// the account in error.
+func (s *ConnectorService) connectAccount(ctx context.Context, c *models.Connector, cred *models.OAuthCredential, tok *oauth2.Token) (string, error) {
+	email, historyID, err := s.identify(ctx, c, tok)
+	if err != nil {
+		return "", err
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return email, err
+	}
+	defer tx.Rollback(ctx)
+
+	var acct *models.GmailAccount
+	if cred.AccountID != nil {
+		if acct, err = queries.GetGmailAccountByID(ctx, tx, *cred.AccountID); err != nil {
+			return email, err
 		}
-		if uerr := queries.UpdateConnectorStatus(ctx, s.pool, c); uerr != nil {
-			log.Printf("connector %s: %v", c.Name, uerr)
+		if !strings.EqualFold(acct.Email, email) {
+			msg := ErrDifferentAccount.Error()
+			if err := queries.UpdateGmailAccountStatus(ctx, tx, acct.ID, models.ConnectorError, &msg); err != nil {
+				return email, err
+			}
+			if err := s.refreshAccounts(ctx, tx, c); err != nil {
+				return email, err
+			}
+			if err := syncMailboxPolls(ctx, tx, c.UserID); err != nil {
+				return email, err
+			}
+			if err := tx.Commit(ctx); err != nil {
+				return email, err
+			}
+			return email, ErrDifferentAccount
 		}
+	} else if acct, err = queries.GetGmailAccountByEmail(ctx, tx, c.ID, email); err != nil && !errors.Is(err, queries.ErrNotFound) {
+		return email, err
+	}
+	access, refresh, expiry, err := s.sealToken(tok)
+	if err != nil {
+		return email, err
+	}
+	if cred.AccountID != nil {
+		err = queries.SaveAccountOAuthToken(ctx, tx, acct.ID, access, refresh, tok.TokenType, expiry)
+	} else {
+		// The pending row becomes the account's credential, replacing the old one.
+		if err = queries.SaveOAuthToken(ctx, tx, c.ID, access, refresh, tok.TokenType, expiry); err != nil {
+			return email, err
+		}
+		if acct == nil {
+			existing, lerr := queries.ListGmailAccounts(ctx, tx, c.ID)
+			if lerr != nil {
+				return email, lerr
+			}
+			acct = &models.GmailAccount{UserID: c.UserID, ConnectorID: c.ID, Email: email, Status: models.ConnectorConnected, Primary: len(existing) == 0, HistoryID: historyID}
+			if err = queries.CreateGmailAccount(ctx, tx, acct); err != nil {
+				return email, err
+			}
+		} else if err = queries.DeleteAccountOAuthCredential(ctx, tx, acct.ID); err != nil {
+			return email, err
+		}
+		err = queries.AttachOAuthCredential(ctx, tx, cred.ID, acct.ID)
+	}
+	if err != nil {
+		return email, err
+	}
+	if err := queries.UpdateGmailAccountStatus(ctx, tx, acct.ID, models.ConnectorConnected, nil); err != nil {
+		return email, err
+	}
+	if c.Kind == models.ConnectorContacts {
+		// The first sync runs on the next trigger tick.
+		if err := queries.ScheduleContactSync(ctx, tx, acct.ID, c.UserID, time.Now()); err != nil {
+			return email, err
+		}
+	}
+	if err := s.refreshAccounts(ctx, tx, c); err != nil {
+		return email, err
+	}
+	if err := syncMailboxPolls(ctx, tx, c.UserID); err != nil {
+		return email, err
+	}
+	return email, tx.Commit(ctx)
+}
+
+// refreshAccounts recomputes a Google connector's status, primary
+// address and tool count from its accounts.
+func (s *ConnectorService) refreshAccounts(ctx context.Context, db queries.DBTX, c *models.Connector) error {
+	accounts, err := queries.ListGmailAccounts(ctx, db, c.ID)
+	if err != nil {
 		return err
 	}
-	c.Account, c.HistoryID = &prof.Email, prof.HistoryID
-	if err := queries.UpdateConnectorAccount(ctx, s.pool, c); err != nil {
+	applyAccounts(c, accounts)
+	switch {
+	case len(accounts) == 0:
+		c.Tools = 0
+	case c.Kind == models.ConnectorCalendar:
+		c.Tools = len(gcal.Tools([]gcal.Account{{}}, "", nil))
+	case c.Kind == models.ConnectorContacts:
+		c.Tools = len(contactTools(nil, uuid.Nil, []contactAccount{{}}))
+	case c.Kind == models.ConnectorDrive:
+		c.Tools = len(gdrive.Tools([]gdrive.Account{{}}, nil))
+	default:
+		c.Tools = len(gmail.Tools([]gmail.Account{{}}, nil))
+	}
+	if err := queries.UpdateConnectorStatus(ctx, db, c); err != nil {
 		return err
 	}
-	c.Status, c.Error, c.Tools = models.ConnectorConnected, nil, len(gmail.Tools(client, historyCursor{s.pool, c}))
-	return queries.UpdateConnectorStatus(ctx, s.pool, c)
+	return queries.UpdateConnectorAccount(ctx, db, c)
+}
+
+// markAccountNeedsAuth records that an account's sign-in stopped working.
+func (s *ConnectorService) markAccountNeedsAuth(id uuid.UUID) {
+	ctx := context.Background()
+	a, err := queries.GetGmailAccountByID(ctx, s.pool, id)
+	if err != nil {
+		return
+	}
+	err = pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if err := queries.UpdateGmailAccountStatus(ctx, tx, id, models.ConnectorNeedsAuth, nil); err != nil {
+			return err
+		}
+		c, err := queries.GetConnector(ctx, tx, a.ConnectorID)
+		if err != nil {
+			return err
+		}
+		if err := s.refreshAccounts(ctx, tx, c); err != nil {
+			return err
+		}
+		return syncMailboxPolls(ctx, tx, a.UserID)
+	})
+	if err != nil {
+		log.Printf("account %s: %v", id, err)
+	}
+}
+
+// applyAccounts sets a gmail or calendar connector's fields from its accounts: connected
+// if any account is, needs_auth if every one is, error otherwise.
+func applyAccounts(c *models.Connector, accounts []*models.GmailAccount) {
+	c.Accounts = accounts
+	if len(accounts) == 0 {
+		return
+	}
+	status, errText := models.ConnectorNeedsAuth, (*string)(nil)
+	connected, needsAuth := false, 0
+	for _, a := range accounts {
+		switch a.Status {
+		case models.ConnectorConnected:
+			connected = true
+		case models.ConnectorNeedsAuth:
+			needsAuth++
+		case models.ConnectorError:
+			if errText == nil {
+				errText = a.Error
+			}
+		}
+	}
+	switch {
+	case connected:
+		status, errText = models.ConnectorConnected, nil
+	case needsAuth == len(accounts):
+		errText = nil
+	default:
+		status = models.ConnectorError
+	}
+	c.Status, c.Error = status, errText
+	primary := accounts[0]
+	for _, a := range accounts {
+		if a.Primary {
+			primary = a
+		}
+	}
+	email := primary.Email
+	c.Account = &email
 }
 
 // needsReconnect records that c's sign-in stopped working and returns what
@@ -496,6 +996,28 @@ func (s *ConnectorService) tokenSource(ctx context.Context, c *models.Connector)
 	if err != nil {
 		return nil, err
 	}
+	return s.sourceFrom(cred, func(t *oauth2.Token) error { return s.saveToken(context.Background(), c, t) })
+}
+
+// accountTokenSource is tokenSource for a gmail or calendar account.
+func (s *ConnectorService) accountTokenSource(ctx context.Context, a *models.GmailAccount) (oauth2.TokenSource, error) {
+	cred, err := queries.GetAccountOAuthCredential(ctx, s.pool, a.ID)
+	if errors.Is(err, queries.ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return s.sourceFrom(cred, func(t *oauth2.Token) error {
+		access, refresh, expiry, err := s.sealToken(t)
+		if err != nil {
+			return err
+		}
+		return queries.SaveAccountOAuthToken(context.Background(), s.pool, a.ID, access, refresh, t.TokenType, expiry)
+	})
+}
+
+func (s *ConnectorService) sourceFrom(cred *models.OAuthCredential, save func(*oauth2.Token) error) (oauth2.TokenSource, error) {
 	if err := s.unseal(cred); err != nil {
 		return nil, err
 	}
@@ -508,24 +1030,24 @@ func (s *ConnectorService) tokenSource(ctx context.Context, c *models.Connector)
 	}
 	// The refresh context outlives this call: the token source lives as long as the session.
 	refreshCtx := context.WithValue(context.Background(), oauth2.HTTPClient, s.http)
-	return &savingTokenSource{
-		inner: s.oauthConfig(cred).TokenSource(refreshCtx, tok),
-		last:  tok.AccessToken,
-		save:  func(t *oauth2.Token) error { return s.saveToken(context.Background(), c, t) },
-	}, nil
+	return &savingTokenSource{inner: s.oauthConfig(cred).TokenSource(refreshCtx, tok), last: tok.AccessToken, save: save}, nil
 }
 
-func (s *ConnectorService) saveToken(ctx context.Context, c *models.Connector, t *oauth2.Token) error {
-	var expiry *time.Time
+// sealToken encrypts t's secrets for storage.
+func (s *ConnectorService) sealToken(t *oauth2.Token) (access, refresh string, expiry *time.Time, err error) {
 	if !t.Expiry.IsZero() {
 		e := t.Expiry.UTC()
 		expiry = &e
 	}
-	access, err := s.box.Seal(t.AccessToken)
-	if err != nil {
-		return err
+	if access, err = s.box.Seal(t.AccessToken); err != nil {
+		return
 	}
-	refresh, err := s.box.Seal(t.RefreshToken)
+	refresh, err = s.box.Seal(t.RefreshToken)
+	return
+}
+
+func (s *ConnectorService) saveToken(ctx context.Context, c *models.Connector, t *oauth2.Token) error {
+	access, refresh, expiry, err := s.sealToken(t)
 	if err != nil {
 		return err
 	}

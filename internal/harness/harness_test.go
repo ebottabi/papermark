@@ -171,3 +171,16 @@ func TestDeltasPublishActivityOncePerCallAndTool(t *testing.T) {
 	case <-time.After(50 * time.Millisecond):
 	}
 }
+
+func TestStampedPutsTheUsersLocalTimeAboveTheirMessages(t *testing.T) {
+	lagos, err := time.LoadLocation("Africa/Lagos")
+	if err != nil {
+		t.Skip("no zone data")
+	}
+	now := time.Date(2026, 10, 17, 1, 45, 0, 0, time.UTC).In(lagos)
+	got := stamped(now, []string{"what day is it?", "and the time?"})
+	want := "[Saturday 17 October 2026, 02:45 WAT]\nwhat day is it?\n\nand the time?"
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}

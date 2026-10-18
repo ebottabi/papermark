@@ -19,6 +19,7 @@ import (
 	"papermark/internal/services"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/google/uuid"
 )
 
 // ConnectorController serves /v1/connectors and the public /v1/oauth/callback.
@@ -92,14 +93,66 @@ func (c *ConnectorController) Authorize(ctx *fiber.Ctx) error {
 // Callback handles GET /v1/oauth/callback, the browser's return from the
 // authorization server. It has no bearer auth: state authenticates it.
 func (c *ConnectorController) Callback(ctx *fiber.Ctx) error {
-	conn, err := c.connectorService.Callback(ctx.Context(), ctx.Query("state"), ctx.Query("code"), ctx.Query("error"))
+	conn, email, err := c.connectorService.Callback(ctx.Context(), ctx.Query("state"), ctx.Query("code"), ctx.Query("error"))
 	q := url.Values{"status": {models.ConnectorConnected}}
 	if conn != nil {
 		q.Set("connector", conn.Name)
+	}
+	if email != "" {
+		q.Set("account", email)
 	}
 	if err != nil {
 		log.Printf("oauth callback: %v", err)
 		q.Set("status", models.ConnectorError)
 	}
 	return ctx.Redirect("keen://oauth?"+q.Encode(), fiber.StatusFound)
+}
+
+// AuthorizeAccount handles POST /v1/connectors/:name/accounts/:id/authorize
+// (gmail or calendar; another name, or an account of another connector, is 404).
+func (c *ConnectorController) AuthorizeAccount(ctx *fiber.Ctx) error {
+	id, err := uuid.Parse(ctx.Params("id"))
+	if err != nil {
+		return c.SendNotFound(ctx, "account not found")
+	}
+	u, err := c.connectorService.AuthorizeAccount(ctx.Context(), middleware.UserID(ctx), ctx.Params("name"), id)
+	switch {
+	case errors.Is(err, queries.ErrNotFound):
+		return c.SendNotFound(ctx, "account not found")
+	case err != nil:
+		return c.SendError(ctx, fiber.StatusBadGateway, "authorization unavailable: "+err.Error(), "BAD_GATEWAY")
+	}
+	return c.SendSuccess(ctx, fiber.Map{"authorizationUrl": u})
+}
+
+// SetPrimary handles POST /v1/connectors/:name/accounts/:id/primary.
+func (c *ConnectorController) SetPrimary(ctx *fiber.Ctx) error {
+	id, err := uuid.Parse(ctx.Params("id"))
+	if err != nil {
+		return c.SendNotFound(ctx, "account not found")
+	}
+	err = c.connectorService.SetPrimary(ctx.Context(), middleware.UserID(ctx), ctx.Params("name"), id)
+	switch {
+	case errors.Is(err, queries.ErrNotFound):
+		return c.SendNotFound(ctx, "account not found")
+	case err != nil:
+		return c.SendInternalError(ctx, "failed to set primary account")
+	}
+	return ctx.SendStatus(fiber.StatusNoContent)
+}
+
+// DeleteAccount handles DELETE /v1/connectors/:name/accounts/:id.
+func (c *ConnectorController) DeleteAccount(ctx *fiber.Ctx) error {
+	id, err := uuid.Parse(ctx.Params("id"))
+	if err != nil {
+		return c.SendNotFound(ctx, "account not found")
+	}
+	err = c.connectorService.DeleteAccount(ctx.Context(), middleware.UserID(ctx), ctx.Params("name"), id)
+	switch {
+	case errors.Is(err, queries.ErrNotFound):
+		return c.SendNotFound(ctx, "account not found")
+	case err != nil:
+		return c.SendInternalError(ctx, "failed to remove account")
+	}
+	return ctx.SendStatus(fiber.StatusNoContent)
 }

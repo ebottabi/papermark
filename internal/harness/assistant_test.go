@@ -16,6 +16,7 @@ import (
 
 	"papermark/internal/cache"
 	"papermark/internal/database"
+	"papermark/internal/harness/tools"
 	"papermark/internal/models"
 	"papermark/internal/models/queries"
 
@@ -42,9 +43,9 @@ func (p *pushes) got() []string {
 	return append([]string(nil), p.texts...)
 }
 
-type fakeRoutines struct{ specs []RoutineSpec }
+type fakeRoutines struct{ specs []tools.RoutineSpec }
 
-func (f *fakeRoutines) CreateRoutine(_ context.Context, _ uuid.UUID, s RoutineSpec) (*models.Schedule, error) {
+func (f *fakeRoutines) CreateRoutine(_ context.Context, _ uuid.UUID, s tools.RoutineSpec) (*models.Schedule, error) {
 	f.specs = append(f.specs, s)
 	next := time.Now().Add(time.Hour)
 	return &models.Schedule{Title: s.Title, NextRunAt: &next}, nil
@@ -74,7 +75,16 @@ func (f *fixture) turn(t *testing.T, schedule *uuid.UUID) *turn {
 	if err := queries.InsertTask(context.Background(), f.pool, task); err != nil {
 		t.Fatal(err)
 	}
-	return &turn{h: f.h, id: task.ID, userID: f.user, scheduleID: schedule, conn: &ConnectorToolset{}}
+	tn := &turn{h: f.h, id: task.ID, userID: f.user, scheduleID: schedule, conn: &ConnectorToolset{}}
+	if err := tn.offer(context.Background(), t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	return tn
+}
+
+// runTool runs one of the turn's built-in tools directly.
+func runTool(tn *turn, name string, input json.RawMessage) (tools.Output, error) {
+	return tn.builtin[name].Run(context.Background(), tn.env, input)
 }
 
 func (f *fixture) prefs(t *testing.T, p models.Preferences) {
@@ -87,7 +97,7 @@ func publish(t *testing.T, tn *turn, importance string) string {
 	t.Helper()
 	in, _ := json.Marshal(map[string]any{"importance": importance, "title": "T " + importance, "body": "b",
 		"sections": []models.Section{{Title: "News", Items: []models.SectionItem{{Text: "x", URL: "https://example.com/a"}}}}})
-	out, err := tn.publishUpdate(context.Background(), in)
+	out, err := runTool(tn, "publish_update", in)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,50 +115,6 @@ func importances(t *testing.T, f *fixture) []string {
 		got = append(got, u.Importance)
 	}
 	return got
-}
-
-func TestPushHeld(t *testing.T) {
-	p := &models.Preferences{Timezone: "Europe/Berlin", QuietStart: "22:00", QuietEnd: "07:00", PushLimit: 2}
-	at := func(s string) time.Time {
-		v, err := time.Parse(time.RFC3339, s)
-		if err != nil {
-			t.Fatal(err)
-		}
-		return v
-	}
-	for _, c := range []struct {
-		name   string
-		now    time.Time
-		pushed int
-		held   bool
-	}{
-		{"daytime under the limit", at("2026-06-10T12:00:00+02:00"), 1, false},
-		{"limit reached", at("2026-06-10T12:00:00+02:00"), 2, true},
-		{"late evening quiet", at("2026-06-10T23:30:00+02:00"), 0, true},
-		{"early morning quiet", at("2026-06-10T06:59:00+02:00"), 0, true},
-		{"quiet ends at 07:00", at("2026-06-10T07:00:00+02:00"), 0, false},
-		{"quiet starts at 22:00", at("2026-06-10T22:00:00+02:00"), 0, true},
-		{"quiet is judged in the user's zone not UTC", at("2026-06-10T21:30:00Z"), 0, true},
-	} {
-		if got := pushHeld(p, c.now, c.pushed) != ""; got != c.held {
-			t.Errorf("%s: held %v, want %v", c.name, got, c.held)
-		}
-	}
-	day := &models.Preferences{Timezone: "UTC", QuietStart: "09:00", QuietEnd: "17:00", PushLimit: 5}
-	if pushHeld(day, at("2026-06-10T12:00:00Z"), 0) == "" || pushHeld(day, at("2026-06-10T18:00:00Z"), 0) != "" {
-		t.Error("a quiet window within one day must hold only inside it")
-	}
-	if pushHeld(&models.Preferences{Timezone: "UTC", QuietStart: "22:00", QuietEnd: "07:00", PushLimit: 0}, at("2026-06-10T12:00:00Z"), 0) == "" {
-		t.Error("a limit of 0 holds every push")
-	}
-}
-
-func TestDayBoundsFollowTheUsersZoneAcrossDST(t *testing.T) {
-	ny, _ := time.LoadLocation("America/New_York")
-	from, to := dayBounds(time.Date(2026, 3, 8, 15, 0, 0, 0, time.UTC), ny)
-	if !from.Equal(time.Date(2026, 3, 8, 5, 0, 0, 0, time.UTC)) || to.Sub(from) != 23*time.Hour {
-		t.Fatalf("spring-forward day %s to %s", from, to)
-	}
 }
 
 func TestPublishUpdateWritesFeedRowAndEvent(t *testing.T) {
@@ -175,7 +141,7 @@ func TestPublishUpdateWritesFeedRowAndEvent(t *testing.T) {
 	if len(f.notify.got()) != 0 {
 		t.Fatalf("a feed update must not notify: %v", f.notify.got())
 	}
-	if _, err := tn.publishUpdate(context.Background(), json.RawMessage(`{"importance":"urgent","title":"x","body":""}`)); err == nil {
+	if _, err := runTool(tn, "publish_update", json.RawMessage(`{"importance":"urgent","title":"x","body":""}`)); err == nil {
 		t.Fatal("unknown importance must be rejected")
 	}
 }
@@ -221,7 +187,7 @@ func TestConfirmStillNotifiesAtThePushLimit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := strings.Join(f.notify.got(), "|"); got != "update:T push|confirm:gmail_send" {
+	if got := strings.Join(f.notify.got(), "|"); got != "update:T push|confirm:Approve: Send an email" {
 		t.Fatalf("notified %q", got)
 	}
 }
@@ -230,7 +196,7 @@ func TestMemoryToolsDedupeAndScopeToTheUser(t *testing.T) {
 	f := newFixture(t)
 	tn := f.turn(t, nil)
 	call := func(name, input string) string {
-		out, err := tn.assistant(context.Background(), toolCall{Name: name, Input: json.RawMessage(input)})
+		out, err := runTool(tn, name, json.RawMessage(input))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -256,11 +222,11 @@ func TestMemoryToolsDedupeAndScopeToTheUser(t *testing.T) {
 		return u.ID
 	}()
 	otn := other.turn(t, nil)
-	out, _ := otn.assistant(context.Background(), toolCall{Name: "memory_search", Input: json.RawMessage(`{"query":"metric"}`)})
+	out, _ := runTool(otn, "memory_search", json.RawMessage(`{"query":"metric"}`))
 	if out.Text != "no matching memories" {
 		t.Fatalf("another user's search saw %q", out.Text)
 	}
-	if _, err := tn.assistant(context.Background(), toolCall{Name: "memory_save", Input: json.RawMessage(`{"text":"  ..  "}`)}); err == nil {
+	if _, err := runTool(tn, "memory_save", json.RawMessage(`{"text":"  ..  "}`)); err == nil {
 		t.Fatal("text without letters or digits must be rejected")
 	}
 }
@@ -337,5 +303,74 @@ func TestThreeFailedRoutineRunsTurnItOffAndTellTheUser(t *testing.T) {
 	ups, _ := queries.ListUpdates(ctx, f.pool, f.user, nil, 10)
 	if len(ups) != 1 || ups[0].Title != "Standup turned off" || ups[0].ScheduleID == nil || *ups[0].ScheduleID != sc.ID {
 		t.Fatalf("notice %+v", ups)
+	}
+}
+
+func TestApprovedCallRunsTheInputTheUserSaw(t *testing.T) {
+	f := newFixture(t)
+	tn := f.turn(t, nil)
+	account := "a@x.com"
+	var ran json.RawMessage
+	tn.conn = &ConnectorToolset{
+		Handlers: map[string]ConnectorHandler{"gmail_send": func(_ context.Context, in json.RawMessage) (string, bool, error) {
+			ran = in
+			return "sent", false, nil
+		}},
+		NeedsApproval: map[string]bool{"gmail_send": true},
+		Resolve: map[string]func(json.RawMessage) (json.RawMessage, error){"gmail_send": func(json.RawMessage) (json.RawMessage, error) {
+			return json.RawMessage(`{"account":"` + account + `"}`), nil
+		}},
+	}
+	call := assistant([2]string{"gmail_send", `{}`})
+	if done, err := tn.runTools(context.Background(), call, false); err != nil || !done {
+		t.Fatalf("park: done=%v err=%v", done, err)
+	}
+	task, err := queries.GetTask(context.Background(), f.pool, tn.id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	answer := "allow"
+	task.Pending.Answer = &answer
+	if err := queries.SetTaskRunState(context.Background(), f.pool, tn.id, task.Pending, task.PartialResults); err != nil {
+		t.Fatal(err)
+	}
+	account = "b@x.com" // the primary changed while the confirm card waited
+	if _, err := tn.runTools(context.Background(), call, true); err != nil {
+		t.Fatal(err)
+	}
+	var got struct{ Account string }
+	json.Unmarshal(ran, &got)
+	if got.Account != "a@x.com" {
+		t.Fatalf("ran with %s, want the approved a@x.com", ran)
+	}
+}
+
+type preparer struct{}
+
+func (preparer) Prepare(_ context.Context, t *models.Task) (string, []string, error) {
+	return "Skill a.\n\n" + t.Prompt, []string{"a", "b"}, nil
+}
+
+func TestFirstTurnPreparesOnlyThePrompt(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	f.h.Preparer = preparer{}
+	tn := f.turn(t, nil)
+	tn.loc = time.UTC
+	for _, text := range []string{"p\n\nAttached files (workspace paths): a.pdf", "and one more thing"} {
+		if err := queries.InsertTaskInbox(ctx, f.pool, tn.id, text); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tn.deliverFirst(ctx); err != nil {
+		t.Fatal(err)
+	}
+	messages, _ := queries.ListTaskMessages(ctx, f.pool, tn.id)
+	if len(messages) != 1 || !strings.Contains(string(messages[0]), `Skill a.\n\np\n\nAttached files (workspace paths): a.pdf\n\nand one more thing`) {
+		t.Fatalf("messages = %s", messages)
+	}
+	events, _ := queries.ListTaskEvents(ctx, f.pool, tn.id, -1)
+	if len(events) != 1 || !strings.Contains(string(events[0].Data), "Using skills: a, b") {
+		t.Fatalf("events = %v", events)
 	}
 }

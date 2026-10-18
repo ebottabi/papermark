@@ -15,10 +15,12 @@ import (
 
 // Gmail account statuses reuse the connector statuses.
 
-// GmailAccount is one signed-in mailbox of a user's gmail connector. Its
-// tokens live in the oauth_credentials row whose account_id is its id.
-// HistoryID is the position of its last "since last" digest. Exactly one live
-// account of a connector is primary (partial index in PostMigrations).
+// GmailAccount is one signed-in Google account of a user's gmail or calendar
+// connector (the table predates calendar). Its tokens live in the
+// oauth_credentials row whose account_id is its id. HistoryID is the position
+// of a gmail account's last "since last" digest; calendar leaves it empty.
+// Exactly one account of a connector is primary, and an address appears once
+// per connector (partial and expression indexes in PostMigrations).
 type GmailAccount struct {
 	ID          uuid.UUID `gorm:"type:uuid;primary_key"`
 	UserID      uuid.UUID `gorm:"type:uuid;not null;index"`

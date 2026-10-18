@@ -161,3 +161,19 @@ func SweepWatchTargets(ctx context.Context, db DBTX) error {
 	_, err := db.Exec(ctx, `DELETE FROM watch_targets t WHERE NOT EXISTS (SELECT 1 FROM watch_subscriptions s WHERE s.target_id = t.id)`)
 	return err
 }
+
+// WatchSubscriptionTarget returns the target a routine is subscribed to, or uuid.Nil.
+func WatchSubscriptionTarget(ctx context.Context, db DBTX, routineID uuid.UUID) (uuid.UUID, error) {
+	var target uuid.UUID
+	err := notFound(db.QueryRow(ctx, `SELECT target_id FROM watch_subscriptions WHERE routine_id = $1`, routineID).Scan(&target))
+	if err == ErrNotFound {
+		return uuid.Nil, nil
+	}
+	return target, err
+}
+
+// CountTriggerEventsSince counts a routine's fires at or after since.
+func CountTriggerEventsSince(ctx context.Context, db DBTX, routineID uuid.UUID, since time.Time) (n int, err error) {
+	err = db.QueryRow(ctx, `SELECT count(*) FROM trigger_events WHERE routine_id = $1 AND created_at >= $2`, routineID, since).Scan(&n)
+	return n, err
+}

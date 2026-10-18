@@ -205,9 +205,11 @@ func (c *Client) Get(ctx context.Context, raw, accept string, cond Conditions) (
 	if err != nil {
 		return nil, err
 	}
+	booked := ""
 	for hop := 0; ; hop++ {
 		host := strings.ToLower(u.Hostname())
-		if c.limiter != nil {
+		if c.limiter != nil && host != booked {
+			booked = host
 			if wait := c.limiter.Take(host, time.Now()); wait > 0 {
 				return nil, &RateLimited{Host: host, RetryAfter: wait}
 			}

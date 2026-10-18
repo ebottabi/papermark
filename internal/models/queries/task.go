@@ -231,3 +231,51 @@ func DrainTaskInbox(ctx context.Context, db DBTX, taskID uuid.UUID) ([]string, e
 	}
 	return out, rows.Err()
 }
+
+// searchedEvents are the task events past-conversation search reads: what
+// the user wrote and what the agent told them, never raw tool output.
+const searchedEvents = `('message', 'reply', 'ask', 'notify', 'idle')`
+
+// ConversationHit is one past task that matched a search, with its best
+// matching events (types and texts in parallel) and its last result.
+type ConversationHit struct {
+	TaskID    uuid.UUID
+	Prompt    string
+	CreatedAt time.Time
+	Types     []string
+	Texts     []string
+	Result    *string
+}
+
+// SearchConversations finds userID's past tasks, other than except, whose
+// messages share words with query; the best matches first.
+func SearchConversations(ctx context.Context, db DBTX, userID, except uuid.UUID, query string, limit int) ([]ConversationHit, error) {
+	rows, err := db.Query(ctx, `WITH q AS (SELECT `+anyWord+` AS q),
+		hits AS (
+			SELECT e.task_id, e.seq, e.type, e.data->>'text' AS text,
+				ts_rank(to_tsvector('english', e.data->>'text'), q.q) AS rank
+			FROM task_events e JOIN tasks t ON t.id = e.task_id, q
+			WHERE t.user_id = $1 AND t.id <> $3 AND e.type IN `+searchedEvents+`
+				AND to_tsvector('english', e.data->>'text') @@ q.q)
+		SELECT t.id, t.prompt, t.created_at,
+			(array_agg(h.type ORDER BY h.rank DESC, h.seq))[1:3],
+			(array_agg(left(h.text, 600) ORDER BY h.rank DESC, h.seq))[1:3],
+			(SELECT left(r.data->>'text', 1000) FROM task_events r
+				WHERE r.task_id = t.id AND r.type = 'idle' ORDER BY r.seq DESC LIMIT 1)
+		FROM hits h JOIN tasks t ON t.id = h.task_id
+		GROUP BY t.id
+		ORDER BY max(h.rank) DESC, t.created_at DESC LIMIT $4`, userID, query, except, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ConversationHit
+	for rows.Next() {
+		var h ConversationHit
+		if err := rows.Scan(&h.TaskID, &h.Prompt, &h.CreatedAt, &h.Types, &h.Texts, &h.Result); err != nil {
+			return nil, err
+		}
+		out = append(out, h)
+	}
+	return out, rows.Err()
+}

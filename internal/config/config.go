@@ -50,13 +50,13 @@ type Config struct {
 }
 
 // ConnectorConfig is one catalog connector: its MCP server (or, for Kind
-// "gmail", the Gmail API origin) and, for providers without dynamic client
+// "gmail", "calendar", "contacts" or "drive", the Google API origin) and, for providers without dynamic client
 // registration, a pre-registered OAuth client. Scopes replaces the broad list
 // the server advertises; AuthParams are extra authorization URL parameters.
 // A gmail connector has no OAuth discovery, so it names Google's AuthURL,
 // TokenURL and RevokeURL itself.
 type ConnectorConfig struct {
-	Kind         string // "mcp" (default) or "gmail"
+	Kind         string // "mcp" (default), "gmail", "calendar", "contacts" or "drive"
 	URL          string
 	AuthURL      string
 	TokenURL     string
@@ -117,6 +117,10 @@ type WorkerConfig struct {
 	Concurrency  int
 	Lease        time.Duration
 	PollInterval time.Duration
+	// InServer runs jobs, schedules and trigger pollers inside cmd/server too.
+	// Set SERVER_BACKGROUND=off on the server unit only (the env file is shared
+	// with cmd/worker) when papermark-worker runs them.
+	InServer bool
 }
 
 // Load reads configuration from environment variables (and a local .env if present).
@@ -171,6 +175,7 @@ func Load() *Config {
 			Concurrency:  getEnvInt("WORKER_CONCURRENCY", 16),
 			Lease:        time.Duration(getEnvInt("WORKER_LEASE_SECONDS", 30)) * time.Second,
 			PollInterval: time.Duration(getEnvInt("WORKER_POLL_MS", 1000)) * time.Millisecond,
+			InServer:     getEnv("SERVER_BACKGROUND", "on") != "off",
 		},
 
 		APNS: APNSConfig{
@@ -200,6 +205,45 @@ func Load() *Config {
 					"https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/gmail.compose")),
 				// Google issues a refresh token only for offline access, and again only with consent.
 				AuthParams: map[string]string{"access_type": "offline", "prompt": "consent"},
+			},
+			// A separate Google sign-in from gmail, usually with the same OAuth client.
+			"calendar": {
+				Kind:         "calendar",
+				URL:          getEnv("CALENDAR_API_URL", "https://www.googleapis.com"),
+				AuthURL:      "https://accounts.google.com/o/oauth2/v2/auth",
+				TokenURL:     "https://oauth2.googleapis.com/token",
+				RevokeURL:    "https://oauth2.googleapis.com/revoke",
+				ClientID:     getEnv("CALENDAR_CLIENT_ID", getEnv("GMAIL_CLIENT_ID", "")),
+				ClientSecret: getEnv("CALENDAR_CLIENT_SECRET", getEnv("GMAIL_CLIENT_SECRET", "")),
+				Scopes: strings.Fields(getEnv("CALENDAR_SCOPES",
+					"https://www.googleapis.com/auth/calendar.events https://www.googleapis.com/auth/calendar.calendarlist.readonly")),
+				AuthParams: map[string]string{"access_type": "offline", "prompt": "consent"},
+			},
+			// Read-only Google Contacts (People API), synced into Postgres in the background.
+			// userinfo.email lets people/me name the address that signed in.
+			"contacts": {
+				Kind:         "contacts",
+				URL:          getEnv("CONTACTS_API_URL", "https://people.googleapis.com"),
+				AuthURL:      "https://accounts.google.com/o/oauth2/v2/auth",
+				TokenURL:     "https://oauth2.googleapis.com/token",
+				RevokeURL:    "https://oauth2.googleapis.com/revoke",
+				ClientID:     getEnv("CONTACTS_CLIENT_ID", getEnv("GMAIL_CLIENT_ID", "")),
+				ClientSecret: getEnv("CONTACTS_CLIENT_SECRET", getEnv("GMAIL_CLIENT_SECRET", "")),
+				Scopes: strings.Fields(getEnv("CONTACTS_SCOPES",
+					"https://www.googleapis.com/auth/contacts.readonly https://www.googleapis.com/auth/contacts.other.readonly https://www.googleapis.com/auth/userinfo.email")),
+				AuthParams: map[string]string{"access_type": "offline", "prompt": "consent"},
+			},
+			// Read-only Google Drive (Drive API v3).
+			"drive": {
+				Kind:         "drive",
+				URL:          getEnv("DRIVE_API_URL", "https://www.googleapis.com"),
+				AuthURL:      "https://accounts.google.com/o/oauth2/v2/auth",
+				TokenURL:     "https://oauth2.googleapis.com/token",
+				RevokeURL:    "https://oauth2.googleapis.com/revoke",
+				ClientID:     getEnv("DRIVE_CLIENT_ID", getEnv("GMAIL_CLIENT_ID", "")),
+				ClientSecret: getEnv("DRIVE_CLIENT_SECRET", getEnv("GMAIL_CLIENT_SECRET", "")),
+				Scopes:       strings.Fields(getEnv("DRIVE_SCOPES", "https://www.googleapis.com/auth/drive.readonly")),
+				AuthParams:   map[string]string{"access_type": "offline", "prompt": "consent"},
 			},
 		},
 	}

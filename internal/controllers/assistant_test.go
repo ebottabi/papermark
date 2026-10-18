@@ -84,7 +84,7 @@ func TestPreferencesMemoriesAndUpdatesAPI(t *testing.T) {
 	}
 	var ids []string
 	for _, title := range []string{"one", "two", "three"} {
-		u := &models.Update{UserID: api.user, TaskID: task.ID, Importance: models.ImportanceFeed, Title: title,
+		u := &models.Update{UserID: api.user, TaskID: &task.ID, Importance: models.ImportanceFeed, Title: title,
 			Sections: []models.Section{{Title: "News", Items: []models.SectionItem{{Text: "a", URL: "https://e.com"}}}}}
 		if err := queries.InsertUpdate(ctx, pool, u); err != nil {
 			t.Fatal(err)
@@ -100,6 +100,14 @@ func TestPreferencesMemoriesAndUpdatesAPI(t *testing.T) {
 		t.Fatalf("list: %d %v", code, body)
 	}
 	before := list[1].(map[string]any)["createdAt"].(string)
+	direct := &models.Update{UserID: api.user, Importance: models.ImportanceFeed, Title: "Price", Body: "€129 → €118"}
+	if err := queries.InsertUpdate(ctx, pool, direct); err != nil {
+		t.Fatal(err)
+	}
+	if _, body := api.do("GET", "/v1/updates?limit=1", ""); body.data()["updates"].([]any)[0].(map[string]any)["taskId"] != nil {
+		t.Fatalf("direct update taskId: %v", body)
+	}
+	pool.Exec(ctx, `DELETE FROM updates WHERE id = $1`, direct.ID)
 	_, body = api.do("GET", "/v1/updates?before="+url.QueryEscape(before), "")
 	if rest := body.data()["updates"].([]any); len(rest) != 1 || rest[0].(map[string]any)["title"] != "one" {
 		t.Fatalf("page 2: %v", body)

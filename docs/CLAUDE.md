@@ -35,8 +35,10 @@ papermark/
 │   ├── responses/               # Response DTOs (exact API.md shapes)
 │   ├── router/                  # Fiber app + route definitions
 │   ├── middleware/              # Session auth (user id in Locals), logging, ratelimit
-│   ├── harness/                 # Agent loop: harness.go (ChatTurn), turn.go, messages.go,
-│   │                            #   tools.go, web.go, connectors.go, events.go (task event log)
+│   ├── harness/                 # Agent loop: harness.go (ChatTurn), turn.go, messages.go, prompt.go,
+│   │   │                        #   preview.go, connectors.go, events.go (task event log)
+│   │   ├── tools/               # Built-in tools, one file each (tool.go: Tool, Env, Offered; web.go)
+│   │   └── skills/              # Built-in skills, one Markdown file each, embedded
 │   ├── services/                # Business logic
 │   │   └── jobs/                # Durable job queue (outbox) + worker loop
 │   ├── workers/                 # Job handlers + the registry both binaries run

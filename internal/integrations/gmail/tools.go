@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/mail"
 	"net/url"
@@ -446,22 +447,25 @@ func readFiles(ws string, paths []string) ([]File, error) {
 		if ws == "" {
 			return nil, errors.New("no workspace to read attachments from")
 		}
-		full, err := storage.Resolve(ws, p)
-		if err != nil {
+		// OpenFile resolves symlinks, so a link inside the workspace cannot attach a file outside it.
+		f, st, err := storage.OpenFile(ws, p)
+		if errors.Is(err, storage.ErrEscape) {
 			return nil, fmt.Errorf("attachment %s: path escapes the workspace", p)
 		}
-		st, err := os.Stat(full)
-		if err != nil || !st.Mode().IsRegular() {
+		if err != nil {
 			return nil, fmt.Errorf("attachment %s: not a file in the workspace", p)
 		}
-		if total += int(st.Size()); total > maxAttachment {
+		total += int(st.Size())
+		if total > maxAttachment {
+			f.Close()
 			return nil, errors.New("attachments are over the 18 MB limit")
 		}
-		data, err := os.ReadFile(full)
+		data, err := io.ReadAll(io.LimitReader(f, maxAttachment+1))
+		f.Close()
 		if err != nil {
 			return nil, err
 		}
-		files = append(files, File{filepath.Base(full), data})
+		files = append(files, File{filepath.Base(p), data})
 	}
 	return files, nil
 }

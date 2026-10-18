@@ -17,10 +17,11 @@ import (
 	"encoding/json"
 	"errors"
 	"log"
-	"papermark/internal/config"
 	"path/filepath"
 
 	"papermark/internal/cache"
+	"papermark/internal/config"
+	"papermark/internal/harness/tools"
 	"papermark/internal/integrations/fireworks"
 	"papermark/internal/models"
 	"papermark/internal/models/queries"
@@ -43,17 +44,19 @@ type TurnPayload struct {
 // rebuilds everything from Postgres, so a retried or re-enqueued job
 // continues where the last one stopped.
 type Harness struct {
-	// Connectors, Notifier and Routines may be replaced after New, before
-	// serving. Without Routines the agent has no routine_create tool.
+	// Connectors, Notifier, Routines and Preparer may be replaced after New,
+	// before serving. Without Routines the agent has no routine_create tool;
+	// without Preparer the first message is the prompt as typed.
 	Connectors ConnectorProvider
 	Notifier   Notifier
-	Routines   RoutineCreator
+	Routines   tools.RoutineCreator
+	Preparer   Preparer
 
 	pool       *pgxpool.Pool
 	bus        cache.Bus
 	client     *fireworks.Client
 	apiKeySet  bool
-	web        *web
+	web        *tools.Web
 	workspaces string
 	// Every turn runs on qualityModel; speedModel is its fallback.
 	qualityModel, speedModel string
@@ -72,7 +75,7 @@ func New(cfg config.AgentConfig, workspaces string, pool *pgxpool.Pool, bus cach
 		bus:             bus,
 		client:          fireworks.New(cfg.FireworksAPIKey, cfg.FireworksBaseURL, cfg.ModelTimeout, cfg.ModelMaxRetries),
 		apiKeySet:       cfg.FireworksAPIKey != "",
-		web:             newWeb(cfg.TavilyAPIKey, []string{cfg.PublicHost}),
+		web:             tools.NewWeb(cfg.TavilyAPIKey, []string{cfg.PublicHost}),
 		workspaces:      workspaces,
 		qualityModel:    cfg.QualityModel,
 		speedModel:      cfg.SpeedModel,
@@ -101,7 +104,7 @@ func (h *Harness) ChatTurn(ctx context.Context, taskID uuid.UUID) error {
 	go func() {
 		for f := range frames {
 			if f.Kind == cache.FrameStop {
-				cancel(errStopped)
+				cancel(tools.ErrStopped)
 			}
 		}
 	}()
@@ -117,11 +120,11 @@ func (h *Harness) ChatTurn(ctx context.Context, taskID uuid.UUID) error {
 		return nil
 	}
 	if task.StopRequested {
-		cancel(errStopped)
+		cancel(tools.ErrStopped)
 	}
 
 	err = h.runTurn(ctx, task)
-	if errors.Is(context.Cause(ctx), errStopped) {
+	if errors.Is(context.Cause(ctx), tools.ErrStopped) {
 		return h.stopped(context.WithoutCancel(ctx), taskID)
 	}
 	if ctx.Err() != nil {
@@ -177,4 +180,9 @@ func (h *Harness) Complete(ctx context.Context, system, prompt string, maxTokens
 		}
 	}
 	return "", errors.New("the model is unavailable")
+}
+
+// SearchURLs returns the result URLs of a web search, for watch routines.
+func (h *Harness) SearchURLs(ctx context.Context, query string) ([]string, error) {
+	return h.web.SearchURLs(ctx, query)
 }

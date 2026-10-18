@@ -25,7 +25,7 @@ func scanGmailAccount(row scannable) (*models.GmailAccount, error) {
 	return a, nil
 }
 
-// CreateGmailAccount inserts a; ErrDuplicate when the user already has the address.
+// CreateGmailAccount inserts a; ErrDuplicate when the connector already has the address.
 func CreateGmailAccount(ctx context.Context, db DBTX, a *models.GmailAccount) error {
 	a.ID = uuid.New()
 	a.CreatedAt = time.Now().UTC()
@@ -48,9 +48,17 @@ func GetGmailAccountByID(ctx context.Context, db DBTX, id uuid.UUID) (*models.Gm
 	return scanGmailAccount(db.QueryRow(ctx, `SELECT `+gmailAccountColumns+` FROM gmail_accounts WHERE id = $1`, id))
 }
 
-// GetGmailAccountByEmail returns userID's account for an address, ignoring case.
-func GetGmailAccountByEmail(ctx context.Context, db DBTX, userID uuid.UUID, email string) (*models.GmailAccount, error) {
-	return scanGmailAccount(db.QueryRow(ctx, `SELECT `+gmailAccountColumns+` FROM gmail_accounts WHERE user_id = $1 AND lower(email) = lower($2)`, userID, email))
+// GetGmailAccountByEmail returns a connector's account for an address, ignoring case.
+func GetGmailAccountByEmail(ctx context.Context, db DBTX, connectorID uuid.UUID, email string) (*models.GmailAccount, error) {
+	return scanGmailAccount(db.QueryRow(ctx, `SELECT `+gmailAccountColumns+` FROM gmail_accounts WHERE connector_id = $1 AND lower(email) = lower($2)`, connectorID, email))
+}
+
+// AccountEmailElsewhere reports whether userID has the address on a connector other than connectorID.
+func AccountEmailElsewhere(ctx context.Context, db DBTX, userID, connectorID uuid.UUID, email string) (bool, error) {
+	var ok bool
+	err := db.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM gmail_accounts WHERE user_id = $1 AND connector_id <> $2 AND lower(email) = lower($3))`,
+		userID, connectorID, email).Scan(&ok)
+	return ok, err
 }
 
 // ListGmailAccounts returns a connector's accounts, oldest first.
@@ -58,9 +66,12 @@ func ListGmailAccounts(ctx context.Context, db DBTX, connectorID uuid.UUID) ([]*
 	return list(ctx, db, scanGmailAccount, `SELECT `+gmailAccountColumns+` FROM gmail_accounts WHERE connector_id = $1 ORDER BY created_at, id`, connectorID)
 }
 
-// ListUserGmailAccounts returns every account of userID, oldest first.
+// ListUserGmailAccounts returns userID's mailboxes (accounts of a live gmail
+// connector, never calendar ones), oldest first.
 func ListUserGmailAccounts(ctx context.Context, db DBTX, userID uuid.UUID) ([]*models.GmailAccount, error) {
-	return list(ctx, db, scanGmailAccount, `SELECT `+gmailAccountColumns+` FROM gmail_accounts WHERE user_id = $1 ORDER BY created_at, id`, userID)
+	return list(ctx, db, scanGmailAccount, `SELECT `+gmailAccountColumns+` FROM gmail_accounts
+		WHERE user_id = $1 AND connector_id IN (SELECT id FROM connectors WHERE user_id = $1 AND kind = 'gmail' AND deleted_at IS NULL)
+		ORDER BY created_at, id`, userID)
 }
 
 // UpdateGmailAccountStatus records the outcome of the latest use of an account.

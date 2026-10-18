@@ -11,14 +11,10 @@ import (
 	"context"
 	"encoding/json"
 
+	"papermark/internal/models"
+
 	"github.com/google/uuid"
 )
-
-// ToolOutput is what a tool call returns to the model.
-type ToolOutput struct {
-	Text    string
-	IsError bool
-}
 
 // ConnectorTool is one tool a connector exposes, named <connector>_<tool>.
 type ConnectorTool struct {
@@ -65,6 +61,14 @@ type ConnectorProvider interface {
 // event commits, on the run's goroutine; errors are logged.
 type Notifier interface {
 	Send(ctx context.Context, taskID, eventType, text string) error
+}
+
+// Preparer builds what the model gets for a task's prompt (skill
+// instructions, project and memory context) and names the skills it picked.
+// It runs in the worker at the first turn, so creating a task never waits on
+// it, and may call a model; it must be safe to repeat after a crash.
+type Preparer interface {
+	Prepare(ctx context.Context, task *models.Task) (text string, skills []string, err error)
 }
 
 type noConnectors struct{}

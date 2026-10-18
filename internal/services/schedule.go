@@ -8,6 +8,7 @@ package services
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -16,11 +17,13 @@ import (
 	_ "time/tzdata" // zone names must resolve on hosts without a zoneinfo database
 	"unicode/utf8"
 
-	"papermark/internal/harness"
+	"papermark/internal/harness/tools"
 	"papermark/internal/models"
 	"papermark/internal/models/queries"
+	"papermark/internal/safehttp"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -59,16 +62,20 @@ var ErrNoTaskCreator = errors.New("schedules: no task creator configured")
 type ScheduleService struct {
 	pool  *pgxpool.Pool
 	tasks TaskCreator
+	web   *safehttp.Client // vets the urls of watch rules
 }
 
 // NewScheduleService constructs a ScheduleService. Slots are computed in each
 // schedule owner's time zone.
 func NewScheduleService(pool *pgxpool.Pool) *ScheduleService {
-	return &ScheduleService{pool: pool}
+	return &ScheduleService{pool: pool, web: safehttp.New(safehttp.Config{})}
 }
 
 // SetTaskCreator wires the service that creates tasks for runs.
 func (s *ScheduleService) SetTaskCreator(tc TaskCreator) { s.tasks = tc }
+
+// SetWebClient replaces the client that vets watch urls (it carries the server's own host).
+func (s *ScheduleService) SetWebClient(c *safehttp.Client) { s.web = c }
 
 // ScheduleFields are the user-editable fields of a schedule.
 type ScheduleFields struct {
@@ -81,6 +88,11 @@ type ScheduleFields struct {
 	Time      string
 	Weekday   *int
 	Enabled   bool
+	// Trigger is time (the default), email or watch; Rule is the JSON of the
+	// EmailRule or WatchRule of the latter two.
+	Trigger        string
+	Rule           json.RawMessage
+	MaxRunsPerHour int
 }
 
 // List returns the user's schedules.
@@ -96,17 +108,7 @@ func (s *ScheduleService) Get(ctx context.Context, user, id uuid.UUID) (*models.
 // Create validates f and stores a schedule whose first run is the next slot.
 func (s *ScheduleService) Create(ctx context.Context, user uuid.UUID, f ScheduleFields) (*models.Schedule, error) {
 	sc := &models.Schedule{UserID: user}
-	loc, err := userLocation(ctx, s.pool, user)
-	if err != nil {
-		return nil, err
-	}
-	if err := apply(sc, f, time.Now(), loc); err != nil {
-		return nil, err
-	}
-	if err := queries.CreateSchedule(ctx, s.pool, sc); err != nil {
-		return nil, err
-	}
-	return sc, nil
+	return sc, s.write(ctx, sc, f, queries.CreateSchedule)
 }
 
 // Update replaces the editable fields of schedule id with f and recomputes the next slot.
@@ -115,28 +117,90 @@ func (s *ScheduleService) Update(ctx context.Context, user, id uuid.UUID, f Sche
 	if err != nil {
 		return nil, err
 	}
-	loc, err := userLocation(ctx, s.pool, user)
+	return sc, s.write(ctx, sc, f, queries.UpdateSchedule)
+}
+
+// write validates f onto sc, stores it with save and syncs the poll tables,
+// all in one transaction. The per-user lock makes the routine limits hold
+// under concurrent creates.
+func (s *ScheduleService) write(ctx context.Context, sc *models.Schedule, f ScheduleFields, save func(context.Context, queries.DBTX, *models.Schedule) error) error {
+	if f.Trigger == "" {
+		f.Trigger = models.TriggerTime
+	}
+	rule, err := s.normalizeRule(ctx, f.Trigger, f.Rule)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	if err := apply(sc, f, time.Now(), loc); err != nil {
-		return nil, err
+	f.Rule = rule
+	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, "routines:"+sc.UserID.String()); err != nil {
+			return err
+		}
+		loc, err := userLocation(ctx, tx, sc.UserID)
+		if err != nil {
+			return err
+		}
+		prev := sc.Trigger
+		if err := apply(sc, f, time.Now(), loc); err != nil {
+			return err
+		}
+		if limit := triggerLimit(sc.Trigger); limit > 0 {
+			n, err := queries.CountTriggerRoutines(ctx, tx, sc.UserID, sc.Trigger, sc.ID)
+			if err != nil {
+				return err
+			}
+			if n >= limit {
+				return invalid("at most %d %s routines", limit, sc.Trigger)
+			}
+		}
+		if err := save(ctx, tx, sc); err != nil {
+			return err
+		}
+		if prev == models.TriggerEmail && sc.Trigger != prev {
+			if err := syncMailboxPolls(ctx, tx, sc.UserID); err != nil {
+				return err
+			}
+		}
+		return syncTrigger(ctx, tx, sc, true)
+	})
+}
+
+func triggerLimit(trigger string) int {
+	switch trigger {
+	case models.TriggerEmail:
+		return MaxEmailRoutines
+	case models.TriggerWatch:
+		return MaxWatchRoutines
 	}
-	if err := queries.UpdateSchedule(ctx, s.pool, sc); err != nil {
-		return nil, err
-	}
-	return sc, nil
+	return 0
 }
 
 // CreateRoutine creates an enabled custom schedule on behalf of the agent.
-func (s *ScheduleService) CreateRoutine(ctx context.Context, user uuid.UUID, r harness.RoutineSpec) (*models.Schedule, error) {
+func (s *ScheduleService) CreateRoutine(ctx context.Context, user uuid.UUID, r tools.RoutineSpec) (*models.Schedule, error) {
 	return s.Create(ctx, user, ScheduleFields{Title: r.Title, Kind: models.ScheduleCustom, Prompt: r.Prompt,
-		Repeat: r.Repeat, Time: r.Time, Weekday: r.Weekday, Enabled: true})
+		Repeat: r.Repeat, Time: r.Time, Weekday: r.Weekday, Enabled: true, Trigger: r.Trigger, Rule: r.Rule})
 }
 
 // Delete removes schedule id.
 func (s *ScheduleService) Delete(ctx context.Context, user, id uuid.UUID) error {
-	return queries.SoftDeleteSchedule(ctx, s.pool, user, id)
+	return pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		sc, err := queries.GetSchedule(ctx, tx, user, id)
+		if err != nil {
+			return err
+		}
+		if err := queries.SoftDeleteSchedule(ctx, tx, user, id); err != nil {
+			return err
+		}
+		return syncTrigger(ctx, tx, sc, false)
+	})
+}
+
+// Triggers returns the latest fires of one of the user's routines, newest first.
+func (s *ScheduleService) Triggers(ctx context.Context, user, id uuid.UUID, limit int) ([]*models.TriggerEvent, error) {
+	if _, err := queries.GetSchedule(ctx, s.pool, user, id); err != nil {
+		return nil, err
+	}
+	return queries.ListTriggerEvents(ctx, s.pool, user, id, limit)
 }
 
 // RunNow creates the schedule's task immediately. The next slot is unchanged.
@@ -221,6 +285,12 @@ func apply(sc *models.Schedule, f ScheduleFields, now time.Time, loc *time.Locat
 	if f.Kind != models.ScheduleCustom && f.Kind != models.ScheduleBrief {
 		return fmt.Errorf("%w: kind must be custom or brief", ErrInvalidSchedule)
 	}
+	if f.Trigger == "" {
+		f.Trigger = models.TriggerTime
+	}
+	if f.Kind == models.ScheduleBrief && f.Trigger != models.TriggerTime {
+		return invalid("a brief runs on a time schedule")
+	}
 	if f.Kind == models.ScheduleBrief {
 		if f.Prompt == "" {
 			f.Prompt = BriefPrompt
@@ -229,11 +299,13 @@ func apply(sc *models.Schedule, f ScheduleFields, now time.Time, loc *time.Locat
 			f.Title = BriefTitle
 		}
 	}
-	if f.Prompt == "" {
+	if strings.TrimSpace(f.Prompt) == "" && f.Trigger != models.TriggerWatch {
 		return fmt.Errorf("%w: prompt is required", ErrInvalidSchedule)
 	}
-	if strings.TrimSpace(f.Title) == "" {
+	if strings.TrimSpace(f.Title) == "" && f.Prompt != "" {
 		f.Title = titleOf(f.Prompt)
+	} else if strings.TrimSpace(f.Title) == "" {
+		f.Title = ruleTitle(f.Trigger, f.Rule)
 	}
 	if utf8.RuneCountInString(f.Title) > 120 {
 		return fmt.Errorf("%w: title must be at most 120 characters", ErrInvalidSchedule)
@@ -244,18 +316,33 @@ func apply(sc *models.Schedule, f ScheduleFields, now time.Time, loc *time.Locat
 	if f.Mode != "speed" && f.Mode != "quality" {
 		return fmt.Errorf("%w: mode must be speed or quality", ErrInvalidSchedule)
 	}
-	if f.Repeat != RepeatWeekly {
-		f.Weekday = nil
+	if f.MaxRunsPerHour == 0 {
+		f.MaxRunsPerHour = models.DefaultMaxRunsPerHour
 	}
-	next, err := NextRun(f.Repeat, f.Time, f.Weekday, now, loc)
-	if err != nil {
-		return err
+	if f.MaxRunsPerHour < 1 || f.MaxRunsPerHour > maxRunsCeiling {
+		return invalid("maxRunsPerHour must be between 1 and %d", maxRunsCeiling)
+	}
+	var next time.Time
+	if f.Trigger == models.TriggerTime {
+		if f.Repeat != RepeatWeekly {
+			f.Weekday = nil
+		}
+		var err error
+		if next, err = NextRun(f.Repeat, f.Time, f.Weekday, now, loc); err != nil {
+			return err
+		}
+	} else {
+		f.Repeat, f.Time, f.Weekday = "", "", nil
+	}
+	if sc.Prompt != f.Prompt {
+		sc.Skills = nil // the next run picks the new prompt's skills
 	}
 	sc.Title, sc.Kind = strings.TrimSpace(f.Title), f.Kind
 	sc.Prompt, sc.Mode, sc.ProjectID = f.Prompt, f.Mode, f.ProjectID
 	sc.Repeat, sc.TimeOfDay, sc.Weekday, sc.Enabled = f.Repeat, f.Time, f.Weekday, f.Enabled
+	sc.Trigger, sc.Rule, sc.MaxRunsPerHour = f.Trigger, f.Rule, f.MaxRunsPerHour
 	sc.NextRunAt = nil
-	if f.Enabled {
+	if f.Enabled && f.Trigger == models.TriggerTime {
 		utc := next.UTC()
 		sc.NextRunAt = &utc
 	}

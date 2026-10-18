@@ -126,7 +126,7 @@ func TestSendRoutesByEnvironmentWithSignedJWTOverHTTP2(t *testing.T) {
 		t.Fatalf("requests: %+v", got)
 	}
 	want := []struct{ host, path, body string }{
-		{EnvSandbox, "/3/device/tok-sb", `{"aps":{"alert":"Need input","sound":"default"},"taskId":"t1","type":"ask"}`},
+		{EnvSandbox, "/3/device/tok-sb", `{"aps":{"alert":"Need input","sound":"default","category":"KEEN_ASK"},"taskId":"t1","type":"ask"}`},
 		{EnvProduction, "/3/device/tok-pr", `{"aps":{"alert":"Done","sound":"default"},"taskId":"t2","type":"idle"}`},
 	}
 	for i, w := range want {

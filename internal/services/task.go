@@ -22,6 +22,7 @@ import (
 
 	"papermark/internal/cache"
 	"papermark/internal/harness"
+	"papermark/internal/harness/skills"
 	"papermark/internal/models"
 	"papermark/internal/models/queries"
 	"papermark/internal/storage"
@@ -89,21 +90,15 @@ func (s *TaskService) create(ctx context.Context, db harness.Beginner, in NewTas
 	if in.Mode != "speed" && in.Mode != "quality" {
 		return uuid.Nil, badRequest("mode must be speed or quality")
 	}
-	var project *models.Project
 	if in.ProjectID != nil {
-		var err error
-		if project, err = queries.GetProject(ctx, s.pool, in.UserID, *in.ProjectID); IsNotFound(err) {
+		if _, err := queries.GetProject(ctx, s.pool, in.UserID, *in.ProjectID); IsNotFound(err) {
 			return uuid.Nil, badRequest("no such project")
 		} else if err != nil {
 			return uuid.Nil, err
 		}
 	}
-	text, err := s.expandSkill(ctx, in.UserID, in.Prompt)
-	if err != nil {
-		return uuid.Nil, err
-	}
-	if text, err = s.withContext(ctx, in.UserID, project, text); err != nil {
-		return uuid.Nil, err
+	if _, err := s.expandSkill(ctx, in.UserID, in.Prompt); err != nil {
+		return uuid.Nil, err // an unknown /name is refused now; the worker expands it
 	}
 	t := &models.Task{Base: models.Base{ID: uuid.New()}, UserID: in.UserID, Prompt: in.Prompt, Status: models.TaskRunning, Mode: in.Mode, ProjectID: in.ProjectID, ScheduleID: in.ScheduleID}
 	files, err := s.saveAttachments(t.ID, in.Attachments)
@@ -111,7 +106,7 @@ func (s *TaskService) create(ctx context.Context, db harness.Beginner, in NewTas
 		return uuid.Nil, err
 	}
 	err = s.s.Harness.CreateTx(ctx, db, t, func(tx pgx.Tx, t *models.Task, emit harness.Emit) error {
-		return s.start(ctx, tx, emit, t.ID, in.Prompt, text, files)
+		return s.start(ctx, tx, emit, t.ID, in.Prompt, in.Prompt, files)
 	})
 	if err != nil {
 		return uuid.Nil, err
@@ -138,23 +133,94 @@ func (s *TaskService) queue(ctx context.Context, tx pgx.Tx, emit harness.Emit, i
 	return queries.InsertTaskInbox(ctx, tx, id, text)
 }
 
+// Prepare builds a task's first message for the model: the /name skill or
+// the picked skills, then the project, knowledge and memory context. The
+// harness calls it at the task's first turn (harness.Preparer).
+func (s *TaskService) Prepare(ctx context.Context, t *models.Task) (string, []string, error) {
+	var project *models.Project
+	if t.ProjectID != nil {
+		var err error
+		if project, err = queries.GetProject(ctx, s.pool, t.UserID, *t.ProjectID); err != nil && !IsNotFound(err) {
+			return "", nil, err
+		}
+	}
+	text, err := s.expandSkill(ctx, t.UserID, t.Prompt)
+	if se := (*StatusError)(nil); errors.As(err, &se) {
+		text, err = t.Prompt, nil // the skill was deleted since the task was created
+	}
+	if err != nil {
+		return "", nil, err
+	}
+	var picked []skills.Skill
+	if !skillCall.MatchString(t.Prompt) {
+		if picked, err = s.pickSkills(ctx, t); err != nil {
+			return "", nil, err
+		}
+		text = skills.Inject(picked, text)
+	}
+	if text, err = s.withContext(ctx, t.UserID, project, text); err != nil {
+		return "", nil, err
+	}
+	return text, skills.Names(picked), nil
+}
+
+// pickSkills chooses the skills a new task follows. A routine's run reuses
+// the skills picked at its first run; any other task asks the model.
+func (s *TaskService) pickSkills(ctx context.Context, t *models.Task) ([]skills.Skill, error) {
+	list, err := skills.For(ctx, s.pool, t.UserID)
+	if err != nil {
+		return nil, err
+	}
+	var complete skills.Completer
+	if s.s.Harness != nil {
+		complete = s.s.Harness.Complete
+	}
+	if t.ScheduleID == nil {
+		picked, _ := skills.Pick(ctx, complete, t.Prompt, list)
+		return picked, nil
+	}
+	sc, err := queries.GetSchedule(ctx, s.pool, t.UserID, *t.ScheduleID)
+	if IsNotFound(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if sc.Skills != nil {
+		return skills.Select(list, sc.Skills), nil
+	}
+	picked, ok := skills.Pick(ctx, complete, sc.Prompt, list)
+	if !ok {
+		return nil, nil // picked again next run
+	}
+	return picked, queries.SetScheduleSkills(ctx, s.pool, t.UserID, sc.ID, sc.Prompt, skills.Names(picked))
+}
+
 var skillCall = regexp.MustCompile(`^/([a-z0-9-]{1,40})(\s|$)`)
 
-// expandSkill replaces a leading /<skill-name> with that skill's instructions.
+// expandSkill replaces a leading /<skill-name> with that skill's instructions:
+// the user's own skill, or else the built-in one.
 func (s *TaskService) expandSkill(ctx context.Context, user uuid.UUID, text string) (string, error) {
 	m := skillCall.FindStringSubmatch(text)
 	if m == nil {
 		return text, nil
 	}
-	skill, err := queries.GetSkillByName(ctx, s.pool, user, m[1])
-	if IsNotFound(err) {
-		return "", badRequest("no such skill: /%s", m[1])
-	}
-	if err != nil {
+	name, instructions := m[1], ""
+	own, err := queries.GetSkillByName(ctx, s.pool, user, name)
+	switch {
+	case err == nil:
+		instructions = own.Instructions
+	case !IsNotFound(err):
 		return "", err
+	default:
+		builtin, ok := skills.Find(name)
+		if !ok {
+			return "", badRequest("no such skill: /%s", name)
+		}
+		instructions = builtin.Instructions
 	}
 	rest := strings.TrimSpace(text[len(m[0]):])
-	out := fmt.Sprintf("Use the skill %q:\n%s", skill.Name, skill.Instructions)
+	out := fmt.Sprintf("Use the skill %q:\n%s", name, instructions)
 	if rest != "" {
 		out += "\n\n" + rest
 	}

@@ -37,17 +37,18 @@ type Config struct {
 	Pool  *pgxpool.Pool
 	Redis *redis.Client // nil when Redis is not configured
 
-	Tasks      *controllers.TaskController
-	Projects   *controllers.ProjectController
-	Knowledge  *controllers.KnowledgeController
-	Skills     *controllers.SkillController
-	Devices    *controllers.DeviceController
-	Schedules  *controllers.ScheduleController
-	Connectors *controllers.ConnectorController
-	Auth       *controllers.AuthController
-	Prefs      *controllers.PreferencesController
-	Updates    *controllers.UpdateController
-	Memories   *controllers.MemoryController
+	Tasks       *controllers.TaskController
+	Projects    *controllers.ProjectController
+	Knowledge   *controllers.KnowledgeController
+	Skills      *controllers.SkillController
+	Devices     *controllers.DeviceController
+	Schedules   *controllers.ScheduleController
+	Connectors  *controllers.ConnectorController
+	GmailLabels *controllers.GmailLabelController
+	Auth        *controllers.AuthController
+	Prefs       *controllers.PreferencesController
+	Updates     *controllers.UpdateController
+	Memories    *controllers.MemoryController
 }
 
 // New builds the Fiber app: error envelope, recover, logger, CORS, /health,
@@ -144,6 +145,7 @@ func Setup(app *fiber.App, cfg *Config) {
 	setupDeviceRoutes(protected, cfg)
 	setupScheduleRoutes(protected, cfg)
 	setupConnectorRoutes(protected, cfg)
+	setupGmailLabelRoutes(protected, cfg)
 	setupAuthRoutes(protected, cfg)
 	setupAssistantRoutes(protected, cfg)
 }
@@ -257,6 +259,7 @@ func setupScheduleRoutes(api fiber.Router, cfg *Config) {
 	api.Patch("/schedules/:id", cfg.Schedules.Update)
 	api.Delete("/schedules/:id", cfg.Schedules.Delete)
 	api.Post("/schedules/:id/run", cfg.Schedules.Run)
+	api.Get("/schedules/:id/triggers", cfg.Schedules.Triggers)
 }
 
 // setupOAuthCallbackRoute registers the public OAuth redirect target; it
@@ -274,6 +277,17 @@ func setupConnectorRoutes(api fiber.Router, cfg *Config) {
 	}
 	api.Get("/connectors", cfg.Connectors.List)
 	api.Post("/connectors", cfg.Connectors.Add)
+	// :name is gmail or calendar; the service answers 404 for an account of another connector.
+	api.Post("/connectors/:name/accounts/:id/authorize", cfg.Connectors.AuthorizeAccount)
+	api.Post("/connectors/:name/accounts/:id/primary", cfg.Connectors.SetPrimary)
+	api.Delete("/connectors/:name/accounts/:id", cfg.Connectors.DeleteAccount)
 	api.Delete("/connectors/:name", cfg.Connectors.Delete)
 	api.Post("/connectors/:name/authorize", cfg.Connectors.Authorize)
+}
+
+func setupGmailLabelRoutes(api fiber.Router, cfg *Config) {
+	if cfg.GmailLabels == nil {
+		return
+	}
+	api.Get("/connectors/gmail/accounts/:id/labels", cfg.GmailLabels.List)
 }

@@ -80,6 +80,7 @@ func main() {
 		Devices:      controllers.NewDeviceController(svcs.Devices),
 		Schedules:    controllers.NewScheduleController(svcs.Schedules),
 		Connectors:   controllers.NewConnectorController(svcs.MCP),
+		GmailLabels:  controllers.NewGmailLabelController(services.NewGmailLabelService(pool, svcs.MCP)),
 		Auth:         controllers.NewAuthController(svcs.Auth),
 		Prefs:        controllers.NewPreferencesController(svcs.Prefs),
 		Updates:      controllers.NewUpdateController(svcs.Updates),
@@ -87,19 +88,25 @@ func main() {
 	})
 
 	workerCtx, workerCancel := context.WithCancel(context.Background())
-	worker := jobs.NewWorker(svcs.Jobs, workers.NewRegistry(svcs), jobs.WorkerOptions{
-		Concurrency:  cfg.Worker.Concurrency,
-		Lease:        cfg.Worker.Lease,
-		PollInterval: cfg.Worker.PollInterval,
-	})
 	workerDone := make(chan struct{})
-	go func() {
-		defer close(workerDone)
-		if err := worker.Run(workerCtx); err != nil && err != context.Canceled {
-			log.Printf("job worker error: %v", err)
-		}
-	}()
-	go workers.RunScheduler(workerCtx, svcs.Schedules, workers.SchedulerInterval)
+	if cfg.Worker.InServer {
+		worker := jobs.NewWorker(svcs.Jobs, workers.NewRegistry(svcs), jobs.WorkerOptions{
+			Concurrency:  cfg.Worker.Concurrency,
+			Lease:        cfg.Worker.Lease,
+			PollInterval: cfg.Worker.PollInterval,
+		})
+		go func() {
+			defer close(workerDone)
+			if err := worker.Run(workerCtx); err != nil && err != context.Canceled {
+				log.Printf("job worker error: %v", err)
+			}
+		}()
+		go workers.RunScheduler(workerCtx, svcs.Schedules, workers.SchedulerInterval)
+		go workers.RunTriggers(workerCtx, svcs.Triggers, workers.TriggerInterval)
+	} else {
+		log.Println("SERVER_BACKGROUND=off: jobs, schedules and triggers run in papermark-worker")
+		close(workerDone)
+	}
 
 	ln, err := net.Listen("tcp", net.JoinHostPort(cfg.Host, cfg.Port))
 	if err != nil {

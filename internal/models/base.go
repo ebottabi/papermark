@@ -64,6 +64,8 @@ func AllModels() []interface{} {
 		&Connector{},
 		&OAuthCredential{},
 		&GmailAccount{},
+		&Contact{},
+		&ContactSync{},
 
 		// Routine triggers
 		&MailboxPoll{},
@@ -95,7 +97,10 @@ func PostMigrations() []string {
 		`CREATE INDEX IF NOT EXISTS updates_user_feed ON updates (user_id, created_at DESC) WHERE importance <> 'quiet'`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS memories_user_text ON memories (user_id, (btrim(regexp_replace(lower(text), '[[:space:][:punct:]]+', ' ', 'g'))))`,
 		`CREATE INDEX IF NOT EXISTS memories_text_fts ON memories USING gin (to_tsvector('english', text))`,
+		`CREATE INDEX IF NOT EXISTS task_events_text_fts ON task_events USING gin (to_tsvector('english', data->>'text'))
+			WHERE type IN ('message', 'reply', 'ask', 'notify', 'idle')`,
 		`ALTER TABLE updates ALTER COLUMN task_id DROP NOT NULL`,
+		`ALTER TABLE schedules ADD COLUMN IF NOT EXISTS skills text[]`,
 		`DROP INDEX IF EXISTS idx_oauth_credentials_connector_id`,
 		// Each gmail connector with a signed-in address becomes one primary account that
 		// takes over the connector's credential. The accounts check makes it run once.
@@ -109,10 +114,15 @@ func PostMigrations() []string {
 		UPDATE oauth_credentials o SET account_id = made.id FROM made WHERE o.connector_id = made.connector_id AND o.account_id IS NULL`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS oauth_credentials_connector_only ON oauth_credentials (connector_id) WHERE account_id IS NULL`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS oauth_credentials_account ON oauth_credentials (account_id) WHERE account_id IS NOT NULL`,
-		`CREATE UNIQUE INDEX IF NOT EXISTS gmail_accounts_user_email ON gmail_accounts (user_id, lower(email))`,
+		// The same address may sign in to both gmail and calendar, so addresses are unique per connector.
+		`DROP INDEX IF EXISTS gmail_accounts_user_email`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS gmail_accounts_connector_email ON gmail_accounts (connector_id, lower(email))`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS gmail_accounts_one_primary ON gmail_accounts (connector_id) WHERE is_primary`,
 		`CREATE INDEX IF NOT EXISTS mailbox_polls_due ON mailbox_polls (next_check_at)`,
 		`CREATE INDEX IF NOT EXISTS trigger_events_feed ON trigger_events (routine_id, created_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS contacts_email_keys ON contacts USING gin (email_keys jsonb_path_ops)`,
+		`CREATE INDEX IF NOT EXISTS contacts_phone_keys ON contacts USING gin (phone_keys jsonb_path_ops)`,
+		`CREATE INDEX IF NOT EXISTS contact_syncs_due ON contact_syncs (next_sync_at)`,
 	}
 }
 

@@ -17,13 +17,13 @@ import (
 )
 
 const scheduleColumns = `id, user_id, title, kind, prompt, mode, project_id, repeat, time_of_day, weekday, enabled,
-	last_run_at, next_run_at, created_at, updated_at, trigger, rule, max_runs_per_hour`
+	last_run_at, next_run_at, created_at, updated_at, trigger, rule, max_runs_per_hour, skills`
 
 const (
 	insertSchedule = `
 		INSERT INTO schedules (id, user_id, title, kind, prompt, mode, project_id, repeat, time_of_day, weekday, enabled,
-			last_run_at, next_run_at, created_at, updated_at, trigger, rule, max_runs_per_hour)
-		VALUES ($1, $14, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $13, $15, $16, $17)`
+			last_run_at, next_run_at, created_at, updated_at, trigger, rule, max_runs_per_hour, skills)
+		VALUES ($1, $14, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $13, $15, $16, $17, $18)`
 
 	selectScheduleByID = `SELECT ` + scheduleColumns + ` FROM schedules WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL`
 
@@ -33,7 +33,7 @@ const (
 	updateSchedule = `
 		UPDATE schedules SET title = $2, kind = $3, prompt = $4, mode = $5, project_id = $6, repeat = $7, time_of_day = $8,
 			weekday = $9, enabled = $10, next_run_at = $11, updated_at = $12, consecutive_failures = 0,
-			trigger = $14, rule = $15, max_runs_per_hour = $16
+			trigger = $14, rule = $15, max_runs_per_hour = $16, skills = $17
 		WHERE id = $1 AND user_id = $13 AND deleted_at IS NULL`
 
 	softDeleteSchedule = `UPDATE schedules SET deleted_at = $3, next_run_at = NULL WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL`
@@ -53,7 +53,7 @@ const (
 func scanSchedule(row scannable) (*models.Schedule, error) {
 	s := &models.Schedule{}
 	err := row.Scan(&s.ID, &s.UserID, &s.Title, &s.Kind, &s.Prompt, &s.Mode, &s.ProjectID, &s.Repeat, &s.TimeOfDay, &s.Weekday, &s.Enabled,
-		&s.LastRunAt, &s.NextRunAt, &s.CreatedAt, &s.UpdatedAt, &s.Trigger, &s.Rule, &s.MaxRunsPerHour)
+		&s.LastRunAt, &s.NextRunAt, &s.CreatedAt, &s.UpdatedAt, &s.Trigger, &s.Rule, &s.MaxRunsPerHour, &s.Skills)
 	if err != nil {
 		return nil, notFound(err)
 	}
@@ -83,11 +83,19 @@ func CreateSchedule(ctx context.Context, db DBTX, s *models.Schedule) error {
 	s.CreatedAt = time.Now().UTC()
 	s.UpdatedAt = s.CreatedAt
 	_, err := db.Exec(ctx, insertSchedule, s.ID, s.Title, s.Kind, s.Prompt, s.Mode, s.ProjectID, s.Repeat, s.TimeOfDay, s.Weekday,
-		s.Enabled, s.LastRunAt, s.NextRunAt, s.CreatedAt, s.UserID, s.Trigger, s.Rule, s.MaxRunsPerHour)
+		s.Enabled, s.LastRunAt, s.NextRunAt, s.CreatedAt, s.UserID, s.Trigger, s.Rule, s.MaxRunsPerHour, s.Skills)
 	return err
 }
 
 // GetSchedule returns one of userID's live schedules.
+// SetScheduleSkills saves the skills a schedule's runs follow, unless an
+// edit cleared them for a new prompt since they were picked from prompt.
+func SetScheduleSkills(ctx context.Context, db DBTX, userID, id uuid.UUID, prompt string, skills []string) error {
+	_, err := db.Exec(ctx, `UPDATE schedules SET skills = $4 WHERE id = $1 AND user_id = $2 AND prompt = $3 AND skills IS NULL`,
+		id, userID, prompt, skills)
+	return err
+}
+
 func GetSchedule(ctx context.Context, db DBTX, userID, id uuid.UUID) (*models.Schedule, error) {
 	return scanSchedule(db.QueryRow(ctx, selectScheduleByID, id, userID))
 }
@@ -101,7 +109,7 @@ func ListSchedules(ctx context.Context, db DBTX, userID uuid.UUID) ([]*models.Sc
 func UpdateSchedule(ctx context.Context, db DBTX, s *models.Schedule) error {
 	s.UpdatedAt = time.Now().UTC()
 	tag, err := db.Exec(ctx, updateSchedule, s.ID, s.Title, s.Kind, s.Prompt, s.Mode, s.ProjectID, s.Repeat, s.TimeOfDay, s.Weekday,
-		s.Enabled, s.NextRunAt, s.UpdatedAt, s.UserID, s.Trigger, s.Rule, s.MaxRunsPerHour)
+		s.Enabled, s.NextRunAt, s.UpdatedAt, s.UserID, s.Trigger, s.Rule, s.MaxRunsPerHour, s.Skills)
 	if err == nil && tag.RowsAffected() == 0 {
 		return ErrNotFound
 	}

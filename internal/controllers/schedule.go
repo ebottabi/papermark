@@ -44,6 +44,10 @@ type ScheduleRequest struct {
 	Time      *string         `json:"time"`
 	Weekday   json.RawMessage `json:"weekday"`
 	Enabled   *bool           `json:"enabled"`
+	Trigger   *string         `json:"trigger"`
+	// Rule null clears the rule.
+	Rule           json.RawMessage `json:"rule"`
+	MaxRunsPerHour *int            `json:"maxRunsPerHour"`
 }
 
 // merge applies the fields present in r onto f.
@@ -69,6 +73,18 @@ func (r ScheduleRequest) merge(f services.ScheduleFields) (services.ScheduleFiel
 	if r.Enabled != nil {
 		f.Enabled = *r.Enabled
 	}
+	if r.Trigger != nil {
+		f.Trigger = *r.Trigger
+	}
+	if r.MaxRunsPerHour != nil {
+		f.MaxRunsPerHour = *r.MaxRunsPerHour
+	}
+	if r.Rule != nil {
+		f.Rule = r.Rule
+		if string(r.Rule) == "null" {
+			f.Rule = nil
+		}
+	}
 	if r.ProjectID != nil {
 		var id *uuid.UUID
 		if err := json.Unmarshal(r.ProjectID, &id); err != nil {
@@ -88,7 +104,8 @@ func (r ScheduleRequest) merge(f services.ScheduleFields) (services.ScheduleFiel
 
 func fieldsOf(s *models.Schedule) services.ScheduleFields {
 	return services.ScheduleFields{Title: s.Title, Kind: s.Kind, Prompt: s.Prompt, Mode: s.Mode, ProjectID: s.ProjectID, Repeat: s.Repeat,
-		Time: s.TimeOfDay, Weekday: s.Weekday, Enabled: s.Enabled}
+		Time: s.TimeOfDay, Weekday: s.Weekday, Enabled: s.Enabled,
+		Trigger: s.Trigger, Rule: s.Rule, MaxRunsPerHour: s.MaxRunsPerHour}
 }
 
 // List handles GET /v1/schedules.
@@ -165,6 +182,24 @@ func (c *ScheduleController) Run(ctx *fiber.Ctx) error {
 		return c.sendErr(ctx, err)
 	}
 	return c.SendCreated(ctx, fiber.Map{"id": taskID}, "")
+}
+
+// Triggers handles GET /v1/schedules/:id/triggers.
+func (c *ScheduleController) Triggers(ctx *fiber.Ctx) error {
+	id, err := uuid.Parse(ctx.Params("id"))
+	if err != nil {
+		return c.SendNotFound(ctx, "schedule not found")
+	}
+	limit := ctx.QueryInt("limit", 30)
+	if limit < 1 {
+		limit = 30
+	}
+	limit = min(limit, 100)
+	es, err := c.scheduleService.Triggers(ctx.Context(), middleware.UserID(ctx), id, limit)
+	if err != nil {
+		return c.sendErr(ctx, err)
+	}
+	return c.SendSuccess(ctx, fiber.Map{"triggers": responses.TriggerEventsResponse(es)})
 }
 
 func (c *ScheduleController) sendErr(ctx *fiber.Ctx, err error) error {

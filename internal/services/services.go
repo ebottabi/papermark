@@ -20,6 +20,7 @@ import (
 	"papermark/internal/models/queries"
 	"papermark/internal/notifications"
 	"papermark/internal/notifications/apns"
+	"papermark/internal/safehttp"
 	"papermark/internal/secretbox"
 	"papermark/internal/services/jobs"
 
@@ -45,6 +46,7 @@ type Services struct {
 	Memories  *MemoryService
 	MCP       *ConnectorService
 	Auth      *AuthService
+	Triggers  *TriggerService
 }
 
 // New wires the services. rdb may be nil (single-process mode: the bus is in-process).
@@ -75,6 +77,7 @@ func New(cfg *config.Config, pool *pgxpool.Pool, rdb *redis.Client) *Services {
 		log.Println("WARNING: ntfy is off: NTFY_TOPIC and NTFY_TOPIC_SECRET (or TOKEN_ENCRYPTION_KEY) are required")
 	}
 	s.Harness.Routines = s.Schedules
+	s.Harness.Preparer = s.Tasks
 	s.Updates = NewUpdateService(pool)
 	s.Memories = NewMemoryService(pool)
 	s.Tasks = &TaskService{pool: pool, s: s}
@@ -82,6 +85,16 @@ func New(cfg *config.Config, pool *pgxpool.Pool, rdb *redis.Client) *Services {
 	s.Knowledge = &KnowledgeService{pool: pool}
 	s.Skills = &SkillService{pool: pool}
 	s.Schedules.SetTaskCreator(s.Tasks)
+	limiter := safehttp.NewLimiter(safehttp.HostInterval)
+	s.Schedules.SetWebClient(safehttp.New(safehttp.Config{DenyHosts: []string{cfg.Agent.PublicHost}, Limiter: limiter}))
+	s.Triggers = NewTriggerService(pool, s.Tasks)
+	s.Triggers.model = s.Harness
+	s.Triggers.web = safehttp.New(safehttp.Config{DenyHosts: []string{cfg.Agent.PublicHost}, Limiter: limiter})
+	s.Triggers.search = s.Harness.SearchURLs
+	s.Triggers.client = s.MCP.MailClient
+	s.Triggers.onAuth = s.MCP.markAccountNeedsAuth
+	s.Triggers.contacts = s.MCP.RunContacts
+	s.Triggers.wake = s.Jobs.Notify
 	s.Auth = NewAuthService(pool, cfg.Auth, NewGoogleVerifier(GoogleCertsURL, cfg.Auth.GoogleClientIDs))
 	return s
 }

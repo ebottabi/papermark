@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -80,6 +81,45 @@ func OpenFile(root, rel string) (*os.File, fs.FileInfo, error) {
 		return nil, nil, fs.ErrNotExist
 	}
 	return f, info, nil
+}
+
+// WriteFile writes data to rel inside root, creating root and rel's directory.
+// It returns ErrEscape when rel, or the real path of its directory (a symlink
+// the agent made could point anywhere), leaves root, and it never follows a
+// symlink at rel itself.
+func WriteFile(root, rel string, data []byte) error {
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		return err
+	}
+	realRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return err
+	}
+	inside := func(p string) bool { return strings.HasPrefix(p, realRoot+string(filepath.Separator)) }
+	p := filepath.Join(realRoot, rel)
+	if !inside(p) {
+		return ErrEscape
+	}
+	dir := filepath.Dir(p)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	realDir, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return err
+	}
+	if realDir != realRoot && !inside(realDir) {
+		return ErrEscape
+	}
+	f, err := os.OpenFile(filepath.Join(realDir, filepath.Base(p)), os.O_WRONLY|os.O_CREATE|os.O_TRUNC|syscall.O_NOFOLLOW, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 // CopyDir copies the tree at src to dst (files, directories and symlinks as

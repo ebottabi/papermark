@@ -4,7 +4,7 @@
  * Proprietary and confidential
  * Written by Ebot Tabi <ebot.tabi@gmail.com>, 16/10/2026
  */
-package harness
+package tools
 
 import (
 	"bytes"
@@ -33,23 +33,24 @@ const (
 	tavilyURL     = "https://api.tavily.com/search"
 )
 
-// web runs web_search (Tavily) and web_fetch. Both are read-only, so they
+// Web runs web_search (Tavily) and web_fetch. Both are read-only, so they
 // need no approval; their output is untrusted page text.
-type web struct {
+type Web struct {
 	tavilyKey string
 	searchURL string
 	search    *http.Client
 	fetch     *safehttp.Client
 }
 
-func newWeb(tavilyKey string, publicHost []string) *web {
-	return &web{tavilyKey: tavilyKey, searchURL: tavilyURL, search: &http.Client{Timeout: 30 * time.Second},
+// NewWeb returns the web client; without tavilyKey there is no web_search.
+func NewWeb(tavilyKey string, publicHost []string) *Web {
+	return &Web{tavilyKey: tavilyKey, searchURL: tavilyURL, search: &http.Client{Timeout: 30 * time.Second},
 		fetch: safehttp.New(safehttp.Config{Timeout: 20 * time.Second, Cap: fetchCap, MaxRedirects: 10, DenyHosts: publicHost})}
 }
 
 // fetchPage fetches raw through the shared SSRF guard: every hop is checked,
 // and so is every address it dials.
-func (w *web) fetchPage(ctx context.Context, raw string) (string, error) {
+func (w *Web) fetchPage(ctx context.Context, raw string) (string, error) {
 	res, err := w.fetch.Get(ctx, raw, "text/html, text/plain;q=0.9, */*;q=0.5", safehttp.Conditions{})
 	switch {
 	case errors.Is(err, safehttp.ErrBlocked):
@@ -151,7 +152,7 @@ type searchResult struct {
 }
 
 // searchWeb asks Tavily for titles, links and short snippets, never bodies.
-func (w *web) searchWeb(ctx context.Context, query string, n int) (string, error) {
+func (w *Web) searchWeb(ctx context.Context, query string, n int) (string, error) {
 	results, err := w.searchResults(ctx, query, n)
 	if err != nil {
 		return "", err
@@ -170,7 +171,7 @@ func (w *web) searchWeb(ctx context.Context, query string, n int) (string, error
 	return strings.TrimRight(b.String(), "\n"), nil
 }
 
-func (w *web) searchResults(ctx context.Context, query string, n int) ([]searchResult, error) {
+func (w *Web) searchResults(ctx context.Context, query string, n int) ([]searchResult, error) {
 	query = strings.TrimSpace(query)
 	if query == "" || len(query) > maxQuery {
 		return nil, fmt.Errorf("query must be 1 to %d characters", maxQuery)
@@ -214,12 +215,15 @@ func (w *web) searchResults(ctx context.Context, query string, n int) ([]searchR
 	return out.Results, nil
 }
 
+// CanSearch says whether web_search is configured.
+func (w *Web) CanSearch() bool { return w != nil && w.tavilyKey != "" }
+
 // SearchURLs returns the result URLs of a web search, for watch routines.
-func (h *Harness) SearchURLs(ctx context.Context, query string) ([]string, error) {
-	if h.web.tavilyKey == "" {
+func (w *Web) SearchURLs(ctx context.Context, query string) ([]string, error) {
+	if !w.CanSearch() {
 		return nil, errors.New("web search is not configured")
 	}
-	results, err := h.web.searchResults(ctx, query, maxResults)
+	results, err := w.searchResults(ctx, query, maxResults)
 	if err != nil {
 		return nil, err
 	}

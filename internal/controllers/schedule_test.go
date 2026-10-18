@@ -9,9 +9,11 @@ package controllers_test
 import (
 	"context"
 	"testing"
+	"time"
 
 	"papermark/internal/controllers"
 	"papermark/internal/database"
+	"papermark/internal/models"
 	"papermark/internal/models/queries"
 	"papermark/internal/router"
 	"papermark/internal/services"
@@ -94,5 +96,82 @@ func TestSchedulesAPI(t *testing.T) {
 		if code, body := api.do(r[0], path, `{}`); code != 404 {
 			t.Errorf("%s %s after delete: %d %v", r[0], path, code, body)
 		}
+	}
+}
+
+func TestTriggerRoutinesAPI(t *testing.T) {
+	pool, _ := database.NewTestDatabase(t)
+	svc := services.NewScheduleService(pool)
+	svc.SetTaskCreator(&recordingTasks{})
+	api := newAPI(t, &router.Config{Pool: pool, Schedules: controllers.NewScheduleController(svc)})
+
+	code, body := api.do("POST", "/v1/schedules", `{"title":"Invoices","prompt":"file it","trigger":"email","rule":{"from":"billing@example.com","hasAttachment":true}}`)
+	s := body.data()
+	rule, _ := s["rule"].(map[string]any)
+	if code != 201 || s["trigger"] != "email" || rule["from"] != "billing@example.com" || rule["hasAttachment"] != true ||
+		s["repeat"] != nil || s["time"] != nil || s["weekday"] != nil || s["nextRunAt"] != nil || s["maxRunsPerHour"] != float64(10) {
+		t.Fatalf("create email routine: %d %v", code, body)
+	}
+	id := s["id"].(string)
+
+	code, body = api.do("POST", "/v1/schedules", `{"prompt":"digest","repeat":"daily","time":"09:00"}`)
+	if s := body.data(); code != 201 || s["trigger"] != "time" || s["rule"] != nil || s["repeat"] != "daily" {
+		t.Fatalf("time schedule: %d %v", code, body)
+	}
+
+	code, body = api.do("PATCH", "/v1/schedules/"+id, `{"maxRunsPerHour":3}`)
+	if s := body.data(); code != 200 || s["maxRunsPerHour"] != float64(3) || s["trigger"] != "email" {
+		t.Fatalf("patch: %d %v", code, body)
+	}
+
+	for _, bad := range []string{
+		`{"prompt":"p","trigger":"email"}`,
+		`{"prompt":"p","trigger":"email","rule":{"account":"a@example.com"}}`,
+		`{"prompt":"p","trigger":"watch","rule":{"kind":"page","url":"http://169.254.169.254/","condition":"changed"}}`,
+		`{"prompt":"p","trigger":"watch","rule":{"kind":"page","url":"https://example.com","condition":"below"}}`,
+		`{"prompt":"p","trigger":"push","rule":{}}`,
+		`{"prompt":"p","trigger":"email","rule":{"from":"a"},"maxRunsPerHour":101}`,
+	} {
+		if code, body := api.do("POST", "/v1/schedules", bad); code != 400 {
+			t.Errorf("%s: %d %v", bad, code, body)
+		}
+	}
+
+	if code, body := api.do("GET", "/v1/schedules/"+id+"/triggers?limit=5", ""); code != 200 {
+		t.Fatalf("triggers: %d %v", code, body)
+	} else if list, ok := body.data()["triggers"].([]any); !ok || len(list) != 0 {
+		t.Fatalf("triggers must be an empty array: %v", body)
+	}
+	other := api.as(newUser(t, pool))
+	if code, _ := other.do("GET", "/v1/schedules/"+id+"/triggers", ""); code != 404 {
+		t.Fatalf("other user triggers: %d", code)
+	}
+	if code, _ := api.do("GET", "/v1/schedules/"+uuid.NewString()+"/triggers", ""); code != 404 {
+		t.Fatalf("unknown routine: %d", code)
+	}
+}
+
+func TestTriggerHistoryShape(t *testing.T) {
+	pool, _ := database.NewTestDatabase(t)
+	svc := services.NewScheduleService(pool)
+	api := newAPI(t, &router.Config{Pool: pool, Schedules: controllers.NewScheduleController(svc)})
+	_, body := api.do("POST", "/v1/schedules", `{"prompt":"p","trigger":"email","rule":{"from":"a@example.com"}}`)
+	id := uuid.MustParse(body.data()["id"].(string))
+	ctx := context.Background()
+	if _, err := queries.InsertTriggerEvents(ctx, pool, id, api.user, []models.TriggerEvent{{SourceKey: "k1", Summary: "first"}}, time.Now().Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := queries.InsertTriggerEvents(ctx, pool, id, api.user, []models.TriggerEvent{{SourceKey: "k2", Summary: "second"}}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	_, body = api.do("GET", "/v1/schedules/"+id.String()+"/triggers", "")
+	list := body.data()["triggers"].([]any)
+	first := list[0].(map[string]any)
+	if len(list) != 2 || first["summary"] != "second" || first["taskId"] != nil || first["createdAt"] == nil || first["id"] == nil {
+		t.Fatalf("triggers: %v", body)
+	}
+	_, body = api.do("GET", "/v1/schedules/"+id.String()+"/triggers?limit=1", "")
+	if len(body.data()["triggers"].([]any)) != 1 {
+		t.Fatalf("limit ignored: %v", body)
 	}
 }

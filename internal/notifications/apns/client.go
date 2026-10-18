@@ -131,10 +131,15 @@ type Alert struct {
 	Type   string
 }
 
+// categories names the app's notification actions per event type: Allow and
+// Decline on an approval, a text reply on a question.
+var categories = map[string]string{"confirm": "KEEN_CONFIRM", "ask": "KEEN_ASK"}
+
 type payload struct {
 	APS struct {
-		Alert string `json:"alert"`
-		Sound string `json:"sound"`
+		Alert    string `json:"alert"`
+		Sound    string `json:"sound"`
+		Category string `json:"category,omitempty"`
 	} `json:"aps"`
 	TaskID string `json:"taskId"`
 	Type   string `json:"type"`
@@ -148,6 +153,7 @@ func (c *Client) Send(ctx context.Context, deviceToken, environment string, a Al
 	}
 	var p payload
 	p.APS.Alert, p.APS.Sound, p.TaskID, p.Type = a.Text, "default", a.TaskID, a.Type
+	p.APS.Category = categories[a.Type]
 	body, err := json.Marshal(p)
 	if err != nil {
 		return err

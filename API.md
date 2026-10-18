@@ -107,7 +107,7 @@ type AgentEvent =
 type Importance = "quiet" | "feed" | "push"
 type Section = { title: string; items: { text: string; detail?: string; url?: string }[] }
 type Update = {
-  id: string; taskId: string; scheduleId: string | null; importance: Importance
+  id: string; taskId: string | null; scheduleId: string | null; importance: Importance
   title: string; body: string; sections: Section[]; read: boolean; createdAt: string
 }
 type Memory = { id: string; text: string; sourceTaskId: string | null; createdAt: string; updatedAt: string }
@@ -118,7 +118,8 @@ type Decision = "allow" | "always" | "deny"
 The first event of every task is its `message` (the prompt). Clients must ignore event types they do not know.
 
 `tool` names: built-ins `message_notify_user`, `file_read`, `file_write`, `shell_exec`, `web_search`, `web_fetch`,
-`publish_update`, `memory_save`, `memory_search`, `routine_create`;
+`publish_update`, `memory_save`, `memory_search`, `conversation_search`, `skill_read`, `routine_create`
+(`{title, prompt, trigger?: "time" | "email" | "watch", repeat?, time?, weekday?, rule?}`; `rule` is required for `email` and `watch` and has the shapes above; still needs approval);
 connector tools are `<connector>_<tool>`. `web_search` is offered only when `TAVILY_API_KEY` is set. Both web tools
 are ordinary tools: each emits a `tool` event with the query/URL as input and the result text as output.
 
@@ -180,13 +181,43 @@ Without them push is off and `POST /devices` still stores the token.
 
 ## Schedules (routines)
 
-`ScheduledTask = {id, title, kind: "custom" | "brief", prompt, mode, projectId, repeat: "hourly" | "daily" | "weekdays" | "weekly", time: "HH:MM", weekday: 1-7 | null, enabled, lastRunAt, nextRunAt, createdAt}`
+```ts
+type ScheduledTask = {
+  id: string; title: string; kind: "custom" | "brief"; prompt: string; mode: Mode; projectId: string | null
+  trigger: "time" | "email" | "watch"                      // default "time"
+  rule: EmailRule | WatchRule | null                        // null for "time"
+  repeat: "hourly" | "daily" | "weekdays" | "weekly" | null // null unless trigger is "time"
+  time: string | null; weekday: number | null              // "HH:MM" and 1-7; null unless trigger is "time"
+  maxRunsPerHour: number                                    // default 10, 1 to 100
+  enabled: boolean; lastRunAt: string | null; nextRunAt: string | null; createdAt: string // nextRunAt is null for email and watch
+}
+type EmailRule = { account?: string; from?: string; subject?: string; label?: string; hasAttachment?: boolean; smart?: string }
+type WatchRule = {
+  kind: "page" | "search"; url?: string; query?: string; selector?: string
+  condition: "changed" | "below" | "above" | "contains" | "newItems"
+  threshold?: number; text?: string; intervalMinutes: number // 1 to 1440, default 1
+}
+```
 `time` and `weekday` are in the owner's `Preferences.timezone` (DST-aware; `weekdays` is Monday to Friday; hourly uses the minute of `time`).
 Changing the time zone moves every enabled schedule's `nextRunAt` so it keeps its wall-clock time.
 GET /schedules → `{schedules: ScheduledTask[]}`, POST /schedules, PATCH /schedules/:id, DELETE /schedules/:id, POST /schedules/:id/run (run now → `{id}` of the task).
-A run creates a normal task with `scheduleId` set. `title` is optional on create (default: the first 40 characters of the prompt, whitespace collapsed; at most 120 characters).
+A run creates a normal task with `scheduleId` set. Email and watch routines are started by the server instead of a clock (below). `title` is optional on create (default: the first 40 characters of the prompt, whitespace collapsed; at most 120 characters).
 `POST /schedules {kind: "brief", time, repeat}` without `prompt` and `title` gets the title "Morning brief" and the server's brief prompt: Email (`gmail_digest` with `sinceLast`, only when Gmail is connected; item `detail` = sender), News (web search and fetch on `Preferences.newsTopics`, else general headlines; item `url` = article link) and Weather (for the time zone's main city, when reachable), published as one `feed` update with empty sections omitted.
 A routine run has a lower step cap (`ROUTINE_MAX_STEPS`, default 40) and is told to end with exactly one `publish_update`. After three runs in a row end in `error` the routine is disabled (`enabled: false`, `nextRunAt: null`) and a `feed` update titled "<title> turned off" is added. A successful run resets the count; editing the routine resets it too.
+
+### Email and watch routines
+
+`trigger: "email"` runs when new mail matches `rule`. `account` limits it to one connected address (any account when absent); `from` and `subject` are case-insensitive substring matches and `label` is a case-insensitive match on a Gmail label id (`INBOX`, `STARRED`, `Label_12`); `hasAttachment` matches mail with or without attachments; `smart` is a plain-words condition the server asks the model about, one call per routine per batch of mail. At least one field other than `account` is required, and `prompt` is required. Mail sent from the account, drafts, and mail sent by Keen (header `X-Keen-Sent`) never match.
+Each connected mailbox is checked about once a minute (spread per user). Mail that arrives while several checks are late is coalesced: one task per routine per check, whose prompt is the routine prompt plus the matching emails (account, id, from, subject, snippet) marked as untrusted data. The first check after a routine or account is added only records the mailbox position, so mail that arrived before it is not matched. If Gmail has dropped the history the server keeps, a `feed` update "Some email was not checked" is added and checking resumes from now. A 401 sets that account to `needs_auth` and stops its checks until it is reconnected.
+
+`trigger: "watch"` runs when a web page or a search result changes. `kind: "page"` needs `url` (public http or https only; loopback, private, link-local, metadata and this server's own host are refused with 400). The refusal reads as a sentence the app can show: "invalid schedule: Keen can only watch public web pages. localhost is a private address." or, for a non-http address, "invalid schedule: Enter a full web address that starts with http:// or https://.". `kind: "search"` needs `query` and watches the set of result URLs. `selector` is a CSS selector for the part of a page to watch, otherwise the whitespace-normalized visible text is used. `below` and `above` need `threshold` and compare the first number in the value (currency symbols and thousands separators are tolerated); `contains` needs `text`; `newItems` fires on result URLs not seen before and is meant for `search`.
+`below`, `above` and `contains` fire once when the condition becomes true and fire again only after it was false in between. `changed` and `newItems` fire on each new change and skip the first reading. A target shared by several routines (same kind, URL or query, selector) is fetched once per interval with `If-None-Match` and `If-Modified-Since`; a 304 changes nothing. Fetches time out after 10 seconds, are capped at 2 MB, follow redirects only to public addresses, are limited to one request per host per 10 seconds, and honour `Retry-After`.
+A watch routine with an empty `prompt` publishes its update directly: importance `feed`, `title` = the routine title, `body` like "€129 → €118", `taskId: null`, `scheduleId` set. With a prompt it starts a task whose prompt carries the old and new values and the added and removed lines, marked as untrusted data. After three readings in a row where the selector matches nothing, one `feed` update "page layout changed" is added. After ten failed fetches in a row the routine is disabled and a `feed` update says so.
+
+`maxRunsPerHour` caps the tasks (email) or fires (watch) a routine starts per hour. Further matches in that hour are dropped, and one `feed` update per hour says so.
+Limits per user: 10 email routines and 20 watch routines. Creating or enabling past the limit returns 400 "at most 10 email routines" (or 20 watch).
+
+`GET /schedules/:id/triggers?limit=30` (1 to 100) → `{triggers: {id, summary, taskId: string | null, createdAt}[]}`, newest first. Each entry is one fire (an email batch or a watch change). `taskId` is null when the update was written without a task. Another user's routine is 404.
 
 ## Preferences
 
@@ -213,27 +244,65 @@ The agent saves with `memory_save {text}` (no approval) and looks up with `memor
 - `Knowledge = {id, title, content, enabled, createdAt}`. GET/POST /knowledge, PATCH/DELETE /knowledge/:id.
   Enabled entries go into every new task's first message (not the system prompt, which stays byte-stable for caching).
 - `Skill = {id, name, description, instructions, createdAt}` (`name` matches `^[a-z0-9-]{1,40}$`, unique). GET/POST /skills, PATCH/DELETE /skills/:id.
+  Built-in skills ship with the server (`bills-and-renewals`, `daily-briefing`, `expenses`, `follow-ups`, `inbox-triage`, `meeting-follow-up`,
+  `meeting-prep`, `research-report`, `schedule-meeting`, `travel-itinerary`, `weekly-review`, `write-in-my-voice`; files in `internal/harness/skills`) and are not listed by GET /skills. A user skill with the same name replaces
+  the built-in one. `/<name>` expands the user's skill, else the built-in one. The agent sees every skill's name and description in
+  `skill_read {name}` and reads one before a matching task.
+  Users never have to name a skill. POST /tasks only validates, stores and queues, and returns at once. At the task's
+  first turn the worker builds the first message: for a prompt without a leading `/<name>`, a short model call picks up
+  to 3 matching skills (or none) and their instructions go in front of it, then the project, knowledge and memory
+  context; the task gets a `notify` event `Using skills: a, b`. A failed pick runs the task without skills. A routine's first run picks its skills and saves them
+  on the schedule, and later runs reuse them; editing the prompt clears them so the next run picks again.
+- `conversation_search {query}` (no approval) searches the user's other tasks: their messages, replies, the agent's questions,
+  notes and results (not tool output). Up to 8 tasks, best match first, each with its date, first line, matching lines and last result.
 
 ## Connectors
 
-`Connector = {name, kind: "mcp" | "gmail", url, status: "connected" | "needs_auth" | "error", error: string | null, tools: number, account: string | null}`.
-`account` is the signed-in address of a `gmail` connector (null for `mcp`). A Gmail call Google rejects with 401, or a refresh
-that fails, sets the connector to `needs_auth`; the tool result then reads "Gmail needs reconnecting in Connectors".
-A failed authorization on an `mcp` connector does the same.
+```ts
+type Connector = {
+  name: string; kind: "mcp" | "gmail" | "calendar" | "contacts" | "drive"; url: string; status: "connected" | "needs_auth" | "error"
+  error: string | null; tools: number
+  account: string | null          // the primary Google address of a Google connector; null for mcp
+  accounts: GmailAccount[]        // signed-in Google accounts of a Google connector; [] for mcp
+}
+type GmailAccount = { id: string; email: string; status: "connected" | "needs_auth" | "error"; error: string | null; primary: boolean }
+```
+A user can connect several Gmail accounts, and separately several Calendar, Contacts and Drive accounts. "Google connector" below means any of `gmail`, `calendar`, `contacts` and `drive`. The connector `status` is `connected` when any account is connected, `needs_auth` when every account needs auth, and `error` otherwise. A Gmail call Google rejects with 401, or a refresh
+that fails, sets only that account to `needs_auth`; the tool result then reads "Gmail account <email> needs reconnecting in Connectors".
+A failed authorization on an `mcp` connector sets the connector to `needs_auth`.
+Accounts created before multi-account support are migrated to one primary account with their tokens and sync position.
 
 | Method | Path | Body | Result |
 |---|---|---|---|
 | GET | /connectors | | `{connectors: Connector[]}`, including catalog connectors not added yet (`needs_auth`, or `error` "Not set up on this server" without a URL) |
 | POST | /connectors | `{name, url}` | `Connector` (tries to connect; `needs_auth` if the server demands OAuth) |
-| DELETE | /connectors/:name | | removes it and its tokens |
-| POST | /connectors/:name/authorize | | `{authorizationUrl}` to open in a browser; adds a catalog connector on first use |
-| GET | /v1/oauth/callback?code&state | | no bearer auth; validates `state`, stores tokens, reconnects, then redirects to `keen://oauth?connector=<name>&status=connected\|error` |
+| DELETE | /connectors/:name | | removes it and its tokens; for a Google connector it removes every account (for `contacts` also every stored contact) |
+| POST | /connectors/:name/authorize | | `{authorizationUrl}` to open in a browser; adds a catalog connector on first use. For a Google connector it adds an account; signing in with an address that is already connected there reconnects that account |
+| POST | /connectors/:kind/accounts/:id/authorize | | `{authorizationUrl}` to reconnect one account (`:kind` is `gmail`, `calendar`, `contacts` or `drive`). Signing in as a different address leaves the account in `error` with "signed in as a different account" |
+| POST | /connectors/:kind/accounts/:id/primary | | 204; makes the account the primary |
+| DELETE | /connectors/:kind/accounts/:id | | 204; revokes the token at Google (best effort) and removes the account (a contacts account also loses its stored contacts and sync state). Removing the primary promotes the oldest remaining account; removing the last account removes the connector |
+| GET | /connectors/gmail/accounts/:id/labels | | `{labels: {id, name, type}[]}` from Gmail `users.labels.list`, in Gmail's order. `type` is `system` (`INBOX`, `STARRED`, ...) or `user`. Use `id` as an email rule's `label`. 404 for another user's account, a calendar account or a malformed id; 409 `NEEDS_AUTH` when the account must sign in again; 502 when Gmail fails |
+| GET | /v1/oauth/callback?code&state | | no bearer auth; validates `state`, stores tokens, reconnects, then redirects to `keen://oauth?connector=<name>&status=connected\|error&account=<email>` (`account` only for Google connectors, the address that signed in) |
+
+Another user's account id, or an account of another connector (a calendar account under `/connectors/gmail/...`, a drive account under `/connectors/contacts/...`, and so on), returns 404 on all three account routes.
 
 The catalog is `gmail` (kind `gmail`), signed in with Google OAuth and served by the Gmail REST API directly (env `GMAIL_API_URL`,
 default `https://gmail.googleapis.com`). The app offers only this one. It needs `GMAIL_CLIENT_ID` and `GMAIL_CLIENT_SECRET`;
 `GMAIL_SCOPES` defaults to `gmail.modify gmail.compose`. The authorization URL adds `access_type=offline&prompt=consent` so Google
-returns a refresh token, and carries no `resource` parameter. After sign-in the server reads the mailbox profile (`account`).
-Deleting the connector revokes the token at Google first, best effort.
+returns a refresh token, and carries no `resource` parameter. After sign-in the server reads the mailbox profile (the account's `email`).
+Deleting the connector or an account revokes the token at Google first, best effort. Each account keeps its own sealed tokens and its own `sinceLast` position.
+
+The catalog also has `calendar` (kind `calendar`), a separate Google sign-in served by the Calendar API v3 (env `CALENDAR_API_URL`,
+default `https://www.googleapis.com`). `CALENDAR_CLIENT_ID` and `CALENDAR_CLIENT_SECRET` default to the Gmail ones; `CALENDAR_SCOPES`
+defaults to `calendar.events calendar.calendarlist.readonly`. After sign-in the server reads the primary calendar, whose id is the
+account's `email`. One address may be connected to both `gmail` and `calendar`; they are two accounts with their own tokens and
+status. Removing one of them does not revoke at Google while the other still uses that address, since Google revokes the whole grant.
+Calendar accounts never feed email routines or Gmail tools.
+
+Every Gmail tool takes an optional `account` (a connected address). Without it:
+- `gmail_search` and `gmail_digest` cover every connected account. Each message or item carries `account`. `gmail_search` returns `nextPageTokens` as `{<email>: token}` instead of `nextPageToken`; pass `account` with `pageToken` to continue one mailbox. An account that fails is listed in `errors` and the rest still answer.
+- `gmail_get_message`, `gmail_get_thread`, `gmail_get_attachment`, `gmail_modify`, `gmail_trash` and `gmail_send_draft` act on one mailbox, so `account` is required when more than one account is connected.
+- `gmail_create_draft`, `gmail_send`, `gmail_forward` and `gmail_list_labels` use the primary account. The `confirm` event input for the sending tools carries the resolved `account`.
 
 Gmail tools (all inputs camelCase). `*` needs approval, and `confirm` with `always` on a `!` tool returns 400
 "this action needs approval every time" (the confirm event carries `allowAlways: false`).
@@ -246,12 +315,95 @@ Gmail tools (all inputs camelCase). `*` needs approval, and `confirm` with `alwa
 | `gmail_digest` | `{query?, sinceLast?, max? (50)}` |
 | `gmail_list_labels` | `{}` |
 | `gmail_get_attachment` | `{messageId, attachmentId, filename?}` saves into the task workspace and returns the path |
-| `gmail_create_draft` | `{to[], cc[], bcc[], subject, body, replyToMessageId?, replyAll?, attachments? (workspace paths)}` |
+| `gmail_create_draft` | `{to[], cc[], bcc[], subject, body, replyToMessageId?, replyAll?, attachments? (workspace paths; a path that leaves the workspace, also through a symlink, is refused; 25 MB in total)}` |
 | `gmail_send` *! | same as `gmail_create_draft` |
 | `gmail_send_draft` *! | `{draftId}` |
 | `gmail_forward` *! | `{messageId, to[], cc[], note?}` with the original attachments |
 | `gmail_modify` | `{ids[], addLabels[], removeLabels[], markRead?, archive?, star?}` |
 | `gmail_trash` * | `{ids[]}` |
+
+Calendar tools take an optional `account` too. Without it `calendar_list_calendars`, `calendar_list_events` and `calendar_free_busy`
+cover every connected account (each item carries `account`; an account that fails is listed in `errors` as `{account, calendarId?, error}`
+and the rest still answer). `calendar_create_event` uses the primary account. `calendar_get_event`, `calendar_update_event`,
+`calendar_delete_event` and `calendar_respond` act on one account, so `account` is required when more than one is connected.
+Times are RFC 3339; a date or a time without an offset is read in the user's `timezone` preference, and new events default to it.
+A 401 or a refused refresh sets that account to `needs_auth` and the tool result reads "Calendar account <email> needs reconnecting in Connectors".
+
+Calendar tools. `*` needs approval every call; `always` is allowed for them. The `confirm` event input is the resolved input:
+`account` and `calendarId` (`primary`) filled in, `timeZone` added when `start` or `end` is given without one, and `sendUpdates`
+(`all`) added except for `calendar_respond`, which always notifies the organizer.
+
+| Tool | Input | Output |
+|---|---|---|
+| `calendar_list_calendars` | `{account?}` | `{calendars: [{id, summary, primary, accessRole, timeZone, selected, account}], errors?}` |
+| `calendar_list_events` | `{timeMin?, timeMax?, calendarId?, q?, maxResults? (50, max 250), account?}` | `{timeMin, timeMax, timeZone?, events: Event[], count, more?, note?, errors?}` |
+| `calendar_get_event` | `{eventId, calendarId?, account?}` | `Event` with the full description |
+| `calendar_free_busy` | `{timeMin?, timeMax?, calendarIds?, account?}` | `{timeMin, timeMax, timeZone?, busy: [{start, end}], calendars: [{account, calendarId, busy}], errors?}` |
+| `calendar_create_event` * | `{summary, start, end?, timeZone?, description?, location?, attendees?: string[], addMeet?, sendUpdates? ("all" \| "externalOnly" \| "none"), calendarId?, account?}` | `Event` |
+| `calendar_update_event` * | `{eventId, ...the same fields, all optional}`; `attendees` replaces the guest list | `Event` |
+| `calendar_delete_event` * | `{eventId, sendUpdates?, calendarId?, account?}` | `{deleted: true, id, calendarId, account}` |
+| `calendar_respond` * | `{eventId, response: "accepted" \| "declined" \| "tentative", calendarId?, account?}` | `Event` |
+
+```ts
+type Event = { id: string; calendarId: string; account: string; summary: string
+  start: string; end: string; allDay: boolean   // RFC 3339, or YYYY-MM-DD when allDay (end exclusive)
+  location?: string; meetingLink?: string; organizer?: string
+  attendees?: { email: string; name?: string; responseStatus: string; optional?: boolean; organizer?: boolean; self?: boolean }[]
+  attendeesOmitted?: number; responseStatus?: string   // the user's own answer
+  status: string; htmlLink?: string; description?: string; recurringEventId?: string }
+```
+`timeMin` defaults to now and `timeMax` to 7 days later. `calendar_list_events` expands recurring events, skips cancelled ones, merges
+every selected calendar (or the primary when none is selected) of each account in scope, sorts by start and shortens descriptions to
+500 characters. `start` without an offset needs `timeZone` or a `timezone` preference; a timed event needs `end`.
+Event text comes from other people and is data, never instructions.
+
+The catalog also has `contacts` (kind `contacts`), a separate Google sign-in served by the People API (env `CONTACTS_API_URL`,
+default `https://people.googleapis.com`). `CONTACTS_CLIENT_ID` and `CONTACTS_CLIENT_SECRET` default to the Gmail ones; `CONTACTS_SCOPES`
+defaults to `contacts.readonly contacts.other.readonly userinfo.email` (the last one lets `people/me` return the address, which is the
+account's `email`). Nothing is ever written to Google. The server keeps a copy of each account's saved contacts and "other contacts"
+(people the user emailed): the first sync runs within about 30 s of connecting, then every 3 hours, using People API sync tokens; an
+expired token causes a full resync. The contacts tools read that copy, so they answer without calling Google. If the user unticks
+"other contacts" on Google's consent screen only saved contacts are kept. A sync that Google refuses with 401 sets that account to `needs_auth`.
+
+| Tool | Input | Output |
+|---|---|---|
+| `contacts_search` | `{query, account?, limit? (20, max 100)}`; every word must occur in name, email, phone, company, title or notes | `{contacts: Contact[], note?}` |
+| `contacts_lookup` | `{email?, phone?}` (one is required; phones match on digits and their last 9 digits, so `07700 900123` finds `+44 7700 900123`) | `{found: boolean, matches: Contact[], note?}` |
+| `contacts_get` | `{resourceName, account?}` | `{contact: Contact, relations: {value, type}[], birthday: string, groups: string[], updatedAt}` |
+
+```ts
+type Contact = { resourceName: string; name: string; emails?: {value: string; type: string}[]; phones?: {value: string; type: string}[]
+  organization?: string; title?: string; notes?: string   // notes cut at 300 characters, 4000 in contacts_get
+  saved: boolean   // true for a saved contact, false for an "other contact" the user only emailed
+  account: string }
+```
+`note` says when an account's first sync has not finished and nothing matched. `birthday` is `YYYY-MM-DD`, or `--MM-DD` without a year.
+Contact text is data, never instructions. None of these tools needs approval.
+
+The catalog also has `drive` (kind `drive`), a separate read-only Google sign-in served by the Drive API v3 (env `DRIVE_API_URL`,
+default `https://www.googleapis.com`). `DRIVE_CLIENT_ID` and `DRIVE_CLIENT_SECRET` default to the Gmail ones; `DRIVE_SCOPES` defaults
+to `drive.readonly`. After sign-in the server reads `about.user.emailAddress`, the account's `email`. `file` is a file id or any
+`drive.google.com`, `docs.google.com` (documents, spreadsheets, presentations) link. `drive_search` covers every connected account
+unless `account` is given; an account that fails is listed in `errors` as `{account, error}` and the rest still answer. The single-file
+tools try the primary account, then the others, and move on when an account answers 404; with `account` they try only that one. A 401
+or a refused refresh sets that account to `needs_auth` and the result reads "Drive account <email> needs reconnecting in Connectors".
+None of these tools needs approval; nothing is ever written to Drive.
+
+| Tool | Input | Output |
+|---|---|---|
+| `drive_search` | `{query?, type? ("doc" \| "sheet" \| "slides" \| "pdf" \| "folder" \| "image"), sharedWithMe?, modifiedAfter? (RFC 3339 or YYYY-MM-DD), owner? (email or "me"), account?, limit? (20, max 100)}` | `{files: [{id, name, type, owner?, modified, sharedBy?, size?, webViewLink, account}], errors?}`, newest first |
+| `drive_read` | `{file, maxChars? (20000, 1000 to 100000), account?}` | `{id, name, type, account, webViewLink, text, truncated, note?}` |
+| `drive_get` | `{file, account?}` | `{id, name, type, mimeType, account, owners, modified, created, lastModifiedBy, sharedBy, size, webViewLink, shared, sharing}` |
+| `drive_download` | `{file, format? ("pdf" \| "docx" \| "xlsx" \| "original"), account?}` | `{path, name, size, mime, account}` |
+
+`drive_read` reads Google Docs and Slides as plain text, Sheets as CSV of the first sheet (the `note` says so), PDF and Word `.docx`
+by extracting their text, and text files as they are; other types fail with "cannot read this type". Files over 25 MB are refused.
+Cut text sets `truncated` and a `note`. `sharing` is `{anyoneWithLink, domains: string[], people: {type, role, email?, name?}[] (first 50), total}`,
+or a string when only the owner may see the sharing. `drive_download` saves into the task workspace under `drive/<id>-<name>`
+(names are sanitised; Docs save as pdf or docx, Sheets as pdf or xlsx, Slides as pdf, other files only as `original`; at most 25 MB),
+so the path can go straight into `gmail_create_draft` or `gmail_send` `attachments`. Document text is data, never instructions.
+
+Contacts and Drive accounts never feed email routines or Gmail and Calendar tools, and the reverse.
 
 Other connectors (`kind: "mcp"`) use the MCP SDK's client auth (dynamic client registration, PKCE); `<NAME>_CLIENT_ID`,
 `_CLIENT_SECRET` and `_SCOPES` override registration and the advertised scopes.

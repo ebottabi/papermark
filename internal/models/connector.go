@@ -21,15 +21,28 @@ const (
 
 // Connector kinds.
 const (
-	ConnectorMCP   = "mcp"
-	ConnectorGmail = "gmail"
+	ConnectorMCP      = "mcp"
+	ConnectorGmail    = "gmail"
+	ConnectorCalendar = "calendar"
+	ConnectorContacts = "contacts"
+	ConnectorDrive    = "drive"
 )
 
-// Connector is a remote MCP server, or a built-in integration (Kind gmail),
+// HasAccounts reports whether connectors of kind keep their Google sign-ins
+// as accounts (gmail, calendar, contacts and drive).
+func HasAccounts(kind string) bool {
+	switch kind {
+	case ConnectorGmail, ConnectorCalendar, ConnectorContacts, ConnectorDrive:
+		return true
+	}
+	return false
+}
+
+// Connector is a remote MCP server, or a built-in integration (Kind gmail, calendar, contacts or drive),
 // whose tools tasks can call. Name is unique among live rows (partial index in
 // PostMigrations) and prefixes its tool names. Status, Error and Tools record
 // the outcome of the latest connection attempt. Account is the signed-in
-// address of a gmail connector's primary account. HistoryID is unused since
+// address of a gmail or calendar connector's primary account. HistoryID is unused since
 // accounts keep their own; the column stays for the migration that reads it.
 type Connector struct {
 	Base
@@ -42,14 +55,16 @@ type Connector struct {
 	Tools     int       `gorm:"not null;default:0" json:"tools"`
 	Account   *string   `gorm:"type:text" json:"account"`
 	HistoryID string    `gorm:"type:varchar(32);not null;default:''" json:"-"`
+
+	Accounts []*GmailAccount `gorm:"-" json:"-"` // a gmail or calendar connector's accounts, set by the service
 }
 
 // TableName for GORM.
 func (Connector) TableName() string { return "connectors" }
 
 // OAuthCredential is a connector's OAuth client registration, its pending
-// authorization (PKCE verifier and hashed state) and its tokens. A gmail
-// account owns its own row (AccountID set); a new account's row has no
+// authorization (PKCE verifier and hashed state) and its tokens. A gmail or
+// calendar account owns its own row (AccountID set); a new account's row has no
 // AccountID until its callback learns the address. Deleting the connector or
 // account hard-deletes it. Secrets are never serialized.
 type OAuthCredential struct {

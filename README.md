@@ -1,7 +1,7 @@
 # Papermark Agent Server
 
 The Go backend for Keen, a mobile-first agent app for iOS. A user gives Keen a task in plain words. The
-server runs an agent loop that calls a model, uses tools (files, shell, web and Gmail), and
+server runs an agent loop that calls a model, uses tools (files, shell, web, Gmail and Calendar), and
 streams every step back to the phone. Each task runs as a durable job in Postgres, so a restart or a
 crashed worker resumes it instead of losing it.
 
@@ -9,6 +9,7 @@ There is no web app. `cmd/server` is the API the iOS app talks to.
 
 - API.md is the HTTP contract with the iOS app.
 - docs/ARCHITECTURE.md covers the packages and data layer.
+- docs/RUNTIME.md shows what runs in the server and the worker, how a chat turn flows, and how triggers fire.
 - docs/HARNESS.md is the design of the agent loop on Fireworks (GLM 5.3 Flash and DeepSeek V4.1 Flash), built in `internal/harness`.
 - docs/CLAUDE.md holds the coding rules. The layout follows bee-saas.
 
@@ -53,7 +54,7 @@ There is no web app. `cmd/server` is the API the iOS app talks to.
 │   lease, heartbeat,                          │                            ││
 │   retry, reclaim                             ├──► workspace files, shell  ││
 │                                              ├──► web search / fetch      ││
-│                                              ├──► Gmail (REST)            ││
+│                                              ├──► Gmail, Calendar (REST)  ││
 │                                              └──► push on finish/ask ─────┼┘
 │                                                                           │
 └───────────────────────────────────────────────────────────────────────────┘
@@ -110,7 +111,7 @@ stopped, or the worker shuts down. Every step is a row, so nothing lives only in
                         ▼
               run each call in order, store each result
               (file_read, file_write, shell_exec, web_search,
-               web_fetch, message_notify_user, Gmail tools)
+               web_fetch, message_notify_user, Gmail and Calendar tools)
                         │
           message_ask_user or an approval? ── yes ──► park, end job
                         │ no                          (/reply or /confirm
@@ -126,11 +127,20 @@ stopped, or the worker shuts down. Every step is a row, so nothing lives only in
 
 The agent's built-in tools are `message_notify_user`, `message_ask_user`, `file_read`, `file_write`,
 `shell_exec` (needs the user's approval), `web_search`, `web_fetch` and `idle`. A connected Gmail
-account adds its native Gmail tools (REST API, not MCP).
+account adds its native Gmail tools, a connected Google Calendar account its Calendar tools, a Contacts account the read-only
+contacts tools and a Drive account the read-only Drive tools (REST APIs, not MCP).
 
 ## Connectors
 
-Keen offers one connector, Gmail. It signs in with OAuth and narrow scopes.
+Keen offers four connectors, Gmail, Calendar, Contacts and Drive. Each is its own Google sign-in with OAuth and narrow scopes, and each can hold several Google accounts.
+Contacts and Drive are read-only. Contacts are copied into Postgres by a background sync every 3 hours (the first one shortly after
+connecting), so lookups never wait on Google. Drive files are read live, and `drive_download` saves a file into the task workspace,
+from where Gmail can attach it.
+
+One-time Google Cloud setup, in the project that holds the Gmail OAuth client: enable the People API and the Google Drive API, add
+the scopes `contacts.readonly`, `contacts.other.readonly`, `userinfo.email` and `drive.readonly` to the OAuth consent screen, and add
+test users while the app is in testing. `drive.readonly` is a restricted scope and the contacts scopes are sensitive, so a public
+app needs Google's verification.
 
 ```
  iPhone              cmd/server                    Google
@@ -259,6 +269,9 @@ curl -H 'Authorization: Bearer <token>' -H 'Content-Type: application/json' \
 | `WORKSPACE_DIR` | Per-task files. Server and workers must share it. |
 | `WORKER_CONCURRENCY`, `WORKER_LEASE_SECONDS`, `WORKER_POLL_MS` | Job worker tuning. |
 | `GMAIL_CLIENT_ID`, `GMAIL_CLIENT_SECRET`, `GMAIL_SCOPES`, `GMAIL_API_URL` | Gmail connector OAuth and API origin. |
+| `CALENDAR_CLIENT_ID`, `CALENDAR_CLIENT_SECRET`, `CALENDAR_SCOPES`, `CALENDAR_API_URL` | Calendar connector OAuth (client defaults to the Gmail one) and API origin. |
+| `CONTACTS_CLIENT_ID`, `CONTACTS_CLIENT_SECRET`, `CONTACTS_SCOPES`, `CONTACTS_API_URL` | Contacts connector OAuth (client defaults to the Gmail one) and People API origin. |
+| `DRIVE_CLIENT_ID`, `DRIVE_CLIENT_SECRET`, `DRIVE_SCOPES`, `DRIVE_API_URL` | Drive connector OAuth (client defaults to the Gmail one, scope `drive.readonly`) and API origin. |
 | `TOKEN_ENCRYPTION_KEY` | 32 bytes, base64. Encrypts stored OAuth tokens at rest. |
 | `APNS_KEY_PATH`, `APNS_KEY_ID`, `APNS_TEAM_ID`, `APNS_TOPIC` | Push. Off unless all four are set. |
 | `NTFY_URL`, `NTFY_TOPIC`, `NTFY_TOPIC_SECRET`, `NTFY_TOKEN` | Push through ntfy. Off unless the URL, the topic prefix and a secret (`NTFY_TOPIC_SECRET`, else `TOKEN_ENCRYPTION_KEY`) are set. Each user's topic is `<NTFY_TOPIC>-<12 hex>` and appears as `ntfyTopic` in `GET /v1/me/preferences`. `NTFY_TOKEN` is an optional bearer token. |
@@ -290,6 +303,12 @@ curl http://<host>/health
 ```
 
 `deploy/papermark-worker.service` runs a standalone worker when agent runs need their own machines.
+With the worker installed, keep the server to the API. Jobs, schedules and trigger pollers then run
+only in the worker, and new tasks start within `WORKER_POLL_MS`. The env file is shared, so set the switch on the server unit:
+
+```sh
+ssh root@<host> 'mkdir -p /etc/systemd/system/papermark.service.d && printf "[Service]\nEnvironment=SERVER_BACKGROUND=off\n" > /etc/systemd/system/papermark.service.d/background.conf && systemctl daemon-reload && systemctl restart papermark'
+```
 
 ### CI/CD
 

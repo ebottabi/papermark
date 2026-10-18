@@ -58,6 +58,9 @@ type PendingAction struct {
 	ToolUseID string  `json:"toolUseId"`
 	Answer    *string `json:"answer,omitempty"`
 	NoAlways  bool    `json:"noAlways,omitempty"` // confirm only: "always" is refused
+	// Input is the resolved input the user saw on the confirm card; the
+	// approved call runs with it, not a fresh resolve (e.g. the Gmail primary changing).
+	Input json.RawMessage `json:"input,omitempty"`
 }
 
 // TaskEvent is one entry of a task's append-only event log. Data is the

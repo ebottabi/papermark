@@ -18,6 +18,8 @@ import (
 	"time"
 
 	"papermark/internal/cache"
+	"papermark/internal/harness/skills"
+	"papermark/internal/harness/tools"
 	"papermark/internal/integrations/fireworks"
 	"papermark/internal/models"
 	"papermark/internal/models/queries"
@@ -46,8 +48,10 @@ type turn struct {
 	scheduleID *uuid.UUID // set when a routine started the task
 	mode       string
 	system     string
+	loc        *time.Location // the user's time zone, for stamping their messages
 	maxSteps   int
-	tools      *tools
+	env        *tools.Env
+	builtin    map[string]tools.Tool // the built-in tools this run offers
 	conn       *ConnectorToolset
 	specs      []json.RawMessage
 }
@@ -71,38 +75,54 @@ func (h *Harness) runTurn(ctx context.Context, task *models.Task) error {
 		defer conn.Close()
 	}
 
+	prefs, err := queries.GetPreferences(ctx, h.pool, task.UserID)
+	if err != nil {
+		return err
+	}
 	tn := &turn{h: h, id: task.ID, userID: task.UserID, scheduleID: task.ScheduleID, mode: task.Mode, conn: conn,
-		system: systemPrompt, maxSteps: h.maxSteps}
+		system: systemPrompt, loc: tools.Location(prefs.Timezone), maxSteps: h.maxSteps}
 	if task.ScheduleID != nil {
-		prefs, err := queries.GetPreferences(ctx, h.pool, task.UserID)
-		if err != nil {
-			return err
-		}
 		tn.system += routineGuidance(prefs, time.Now())
 		tn.maxSteps = min(h.maxSteps, h.routineMaxSteps)
 	}
-	tn.tools = &tools{workspace: workspace, web: h.web, notify: func(text string) error {
-		return h.TaskTx(ctx, task.ID, func(_ pgx.Tx, _ *models.Task, emit Emit) error {
-			return emit(TextEvent{"notify", text})
-		})
-	}}
-	tn.specs = slices.Clone(builtinTools)
-	if h.web.tavilyKey != "" {
-		tn.specs = append(tn.specs, webSearchTool)
-	}
-	tn.specs = append(tn.specs, assistantTools...)
-	if h.Routines != nil && task.ScheduleID == nil {
-		tn.specs = append(tn.specs, routineCreateTool)
+	if err := tn.offer(ctx, workspace); err != nil {
+		return err
 	}
 	for _, t := range conn.Tools {
 		if externalRef(t.InputSchema) {
 			log.Printf("agent: skipping connector tool %s: its schema has an external $ref", t.Name)
 			continue
 		}
-		tn.specs = append(tn.specs, fn(t.Name, t.Description, t.InputSchema))
+		tn.specs = append(tn.specs, tools.Function(t.Name, t.Description, t.InputSchema))
 	}
 
 	return tn.run(ctx)
+}
+
+// offer gives the turn its built-in tools, bound to the task, and starts
+// the specs with them; connector tools follow.
+func (tn *turn) offer(ctx context.Context, workspace string) error {
+	list, err := skills.For(ctx, tn.h.pool, tn.userID)
+	if err != nil {
+		return err
+	}
+	tn.env = &tools.Env{Skills: list, Workspace: workspace, TaskID: tn.id, UserID: tn.userID, ScheduleID: tn.scheduleID,
+		DB: tn.h.pool, Web: tn.h.web, Routines: tn.h.Routines,
+		Notify: func(ctx context.Context, text string) error {
+			return tn.h.TaskTx(ctx, tn.id, func(_ pgx.Tx, _ *models.Task, emit Emit) error {
+				return emit(TextEvent{"notify", text})
+			})
+		},
+		TaskTx: func(ctx context.Context, fn func(tx pgx.Tx, emit func(event any) error) error) error {
+			return tn.h.TaskTx(ctx, tn.id, func(tx pgx.Tx, _ *models.Task, emit Emit) error { return fn(tx, emit) })
+		}}
+	tn.builtin = map[string]tools.Tool{}
+	tn.specs = nil
+	for _, t := range tools.Offered(tn.env, tn.scheduleID != nil) {
+		tn.builtin[t.Name] = t
+		tn.specs = append(tn.specs, tools.Function(t.Name, t.Description, t.Schema))
+	}
+	return nil
 }
 
 // run resumes the turn from its stored messages, then loops: call the
@@ -116,6 +136,10 @@ func (tn *turn) run(ctx context.Context) error {
 	}
 	if n := len(messages); n > 0 && roleOf(messages[n-1]) == "assistant" {
 		if done, err := tn.runTools(ctx, messages[n-1], true); err != nil || done {
+			return err
+		}
+	} else if len(messages) == 0 {
+		if err := tn.deliverFirst(ctx); err != nil {
 			return err
 		}
 	} else if err := tn.deliverInbox(ctx); err != nil {
@@ -267,14 +291,58 @@ func (tn *turn) deltas(ctx context.Context) func(fireworks.Delta) {
 	}
 }
 
+// stamped joins the user's queued messages under their local date and time,
+// so the model never needs a clock (or shell_exec) to know what day it is.
+// The stamp is stored with the message, which keeps the prompt cache stable.
+func stamped(now time.Time, texts []string) string {
+	return "[" + now.Format("Monday 2 January 2006, 15:04 MST") + "]\n" + strings.Join(texts, "\n\n")
+}
+
 // deliverInbox turns queued messages into the next user turn.
 func (tn *turn) deliverInbox(ctx context.Context) error {
-	return tn.h.TaskTx(ctx, tn.id, func(tx pgx.Tx, _ *models.Task, _ Emit) error {
+	return tn.deliver(ctx, nil)
+}
+
+// deliverFirst is deliverInbox for a task's first turn: the prompt that
+// starts the first queued message is replaced by what the Preparer builds,
+// outside the task lock since it may call a model. A retry prepares again.
+func (tn *turn) deliverFirst(ctx context.Context) error {
+	if tn.h.Preparer == nil {
+		return tn.deliverInbox(ctx)
+	}
+	task, err := queries.GetTask(ctx, tn.h.pool, tn.id)
+	if err != nil {
+		return err
+	}
+	text, picked, err := tn.h.Preparer.Prepare(ctx, task)
+	if err != nil {
+		return err
+	}
+	return tn.deliver(ctx, func(texts []string, emit Emit) error {
+		if rest, ok := strings.CutPrefix(texts[0], task.Prompt); ok {
+			texts[0] = text + rest
+		}
+		if len(picked) == 0 {
+			return nil
+		}
+		return emit(TextEvent{"notify", "Using skills: " + strings.Join(picked, ", ")})
+	})
+}
+
+// deliver drains the inbox into one user message; edit, when set, changes
+// the drained texts in the same transaction.
+func (tn *turn) deliver(ctx context.Context, edit func(texts []string, emit Emit) error) error {
+	return tn.h.TaskTx(ctx, tn.id, func(tx pgx.Tx, _ *models.Task, emit Emit) error {
 		texts, err := queries.DrainTaskInbox(ctx, tx, tn.id)
 		if err != nil || len(texts) == 0 {
 			return err
 		}
-		msg, err := userMessage(strings.Join(texts, "\n\n"))
+		if edit != nil {
+			if err := edit(texts, emit); err != nil {
+				return err
+			}
+		}
+		msg, err := userMessage(stamped(time.Now().In(tn.loc), texts))
 		if err != nil {
 			return err
 		}
@@ -311,6 +379,9 @@ func (tn *turn) runTools(ctx context.Context, assistant json.RawMessage, resume 
 			if err := queries.SetTaskRunState(ctx, tn.h.pool, tn.id, nil, task.PartialResults); err != nil {
 				return false, err
 			}
+			if p.Input != nil {
+				calls[i].Input, invalid[i] = p.Input, nil
+			}
 			out, ev := tn.answered(ctx, calls[i], p.Kind, *p.Answer)
 			if err := tn.record(ctx, calls[i], out, ev); err != nil {
 				return false, err
@@ -318,7 +389,7 @@ func (tn *turn) runTools(ctx context.Context, assistant json.RawMessage, resume 
 			i++
 		} else {
 			for ; i < len(calls); i++ {
-				if err := tn.record(ctx, calls[i], ToolOutput{Text: interruptedText, IsError: true}, nil); err != nil {
+				if err := tn.record(ctx, calls[i], tools.Output{Text: interruptedText, IsError: true}, nil); err != nil {
 					return false, err
 				}
 			}
@@ -328,12 +399,12 @@ func (tn *turn) runTools(ctx context.Context, assistant json.RawMessage, resume 
 		c := calls[i]
 		switch {
 		case invalid[i] != nil:
-			out := ToolOutput{Text: "Error: " + invalid[i].Error(), IsError: true}
+			out := tools.Output{Text: "Error: " + invalid[i].Error(), IsError: true}
 			if err := tn.record(ctx, c, out, ToolEvent{"tool", c.Name, c.Input, out.Text, true}); err != nil {
 				return false, err
 			}
 		case c.Input == nil:
-			out := ToolOutput{Text: "Error: the arguments must be a JSON object.", IsError: true}
+			out := tools.Output{Text: "Error: the arguments must be a JSON object.", IsError: true}
 			if err := tn.record(ctx, c, out, ToolEvent{"tool", c.Name, c.eventInput(), out.Text, true}); err != nil {
 				return false, err
 			}
@@ -344,7 +415,7 @@ func (tn *turn) runTools(ctx context.Context, assistant json.RawMessage, resume 
 			json.Unmarshal(c.Input, &in)
 			return true, tn.park(ctx, c, TextEvent{"ask", in.Text})
 		case c.Name == "idle":
-			if err := tn.record(ctx, c, ToolOutput{Text: "ok"}, nil); err != nil {
+			if err := tn.record(ctx, c, tools.Output{Text: "ok"}, nil); err != nil {
 				return false, err
 			}
 		case tn.needsApproval(c.Name) && !slices.Contains(task.AlwaysAllowed, c.Name):
@@ -360,11 +431,11 @@ func (tn *turn) runTools(ctx context.Context, assistant json.RawMessage, resume 
 }
 
 // answered applies the user's reply or decision to the call the task parked on.
-func (tn *turn) answered(ctx context.Context, c toolCall, kind, answer string) (ToolOutput, any) {
+func (tn *turn) answered(ctx context.Context, c toolCall, kind, answer string) (tools.Output, any) {
 	if kind == "ask" {
-		return ToolOutput{Text: answer}, nil
+		return tools.Output{Text: answer}, nil
 	}
-	out := ToolOutput{Text: "The user declined this action.", IsError: true}
+	out := tools.Output{Text: "The user declined this action.", IsError: true}
 	if answer != "deny" {
 		out = tn.execute(ctx, c)
 	}
@@ -372,32 +443,30 @@ func (tn *turn) answered(ctx context.Context, c toolCall, kind, answer string) (
 }
 
 func (tn *turn) needsApproval(name string) bool {
-	return name == "shell_exec" || name == "routine_create" || (tn.conn.Handlers[name] != nil && tn.conn.NeedsApproval[name])
+	return tn.builtin[name].NeedsApproval || (tn.conn.Handlers[name] != nil && tn.conn.NeedsApproval[name])
 }
 
-func (tn *turn) execute(ctx context.Context, c toolCall) ToolOutput {
-	var out ToolOutput
+func (tn *turn) execute(ctx context.Context, c toolCall) tools.Output {
+	var out tools.Output
 	var err error
 	switch {
-	case isAssistantTool(c.Name):
-		out, err = tn.assistant(ctx, c)
-	case tn.tools.has(c.Name):
-		out, err = tn.tools.call(ctx, c.Name, c.Input)
+	case tn.builtin[c.Name].Run != nil:
+		out, err = tn.builtin[c.Name].Run(ctx, tn.env, c.Input)
 	case tn.conn.Handlers[c.Name] != nil:
-		out.Text, out.IsError, err = tn.conn.Handlers[c.Name](context.WithValue(ctx, workspaceKey{}, tn.tools.workspace), c.Input)
+		out.Text, out.IsError, err = tn.conn.Handlers[c.Name](context.WithValue(ctx, workspaceKey{}, tn.env.Workspace), c.Input)
 	default:
-		out = ToolOutput{Text: "Unknown tool: " + c.Name, IsError: true}
+		out = tools.Output{Text: "Unknown tool: " + c.Name, IsError: true}
 	}
 	if err != nil {
-		out = ToolOutput{Text: err.Error(), IsError: true}
+		out = tools.Output{Text: err.Error(), IsError: true}
 	}
 	return out
 }
 
 // record stores one call's result (and its event) so a retried run skips it.
 // A call cut short by shutdown is not recorded: the retry reports it as interrupted.
-func (tn *turn) record(ctx context.Context, c toolCall, out ToolOutput, event any) error {
-	if ctx.Err() != nil && !errors.Is(context.Cause(ctx), errStopped) {
+func (tn *turn) record(ctx context.Context, c toolCall, out tools.Output, event any) error {
+	if ctx.Err() != nil && !errors.Is(context.Cause(ctx), tools.ErrStopped) {
 		return ctx.Err()
 	}
 	text := out.Text
@@ -435,7 +504,7 @@ func (tn *turn) park(ctx context.Context, c toolCall, event any) error {
 		if err := emit(event); err != nil {
 			return err
 		}
-		return queries.SetTaskRunState(ctx, tx, tn.id, &models.PendingAction{Kind: kind, Name: c.Name, ToolUseID: c.ID, NoAlways: tn.conn.NoAlways[c.Name]}, t.PartialResults)
+		return queries.SetTaskRunState(ctx, tx, tn.id, &models.PendingAction{Kind: kind, Name: c.Name, ToolUseID: c.ID, NoAlways: tn.conn.NoAlways[c.Name], Input: c.Input}, t.PartialResults)
 	})
 }
 
@@ -454,7 +523,7 @@ func (tn *turn) finish(ctx context.Context, calls []toolCall, assistant json.Raw
 			}
 		}
 		if len(texts) > 0 {
-			msg, err := userMessage(strings.Join(texts, "\n\n"))
+			msg, err := userMessage(stamped(time.Now().In(tn.loc), texts))
 			if err != nil {
 				return err
 			}

@@ -32,7 +32,7 @@ func PreferencesResponse(p *models.Preferences, ntfyTopic *string) PreferencesDT
 // UpdateDTO is API.md's Update.
 type UpdateDTO struct {
 	ID         string           `json:"id"`
-	TaskID     string           `json:"taskId"`
+	TaskID     *string          `json:"taskId"`
 	ScheduleID *string          `json:"scheduleId"`
 	Importance string           `json:"importance"`
 	Title      string           `json:"title"`
@@ -46,10 +46,14 @@ type UpdateDTO struct {
 func UpdatesResponse(us []*models.Update) []UpdateDTO {
 	out := make([]UpdateDTO, 0, len(us))
 	for _, u := range us {
-		d := UpdateDTO{ID: u.ID.String(), TaskID: u.TaskID.String(), Importance: u.Importance, Title: u.Title,
+		d := UpdateDTO{ID: u.ID.String(), Importance: u.Importance, Title: u.Title,
 			Body: u.Body, Sections: u.Sections, Read: u.ReadAt != nil, CreatedAt: Time(u.CreatedAt)}
 		if d.Sections == nil {
 			d.Sections = []models.Section{}
+		}
+		if u.TaskID != nil {
+			id := u.TaskID.String()
+			d.TaskID = &id
 		}
 		if u.ScheduleID != nil {
 			id := u.ScheduleID.String()
