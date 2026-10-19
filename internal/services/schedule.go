@@ -20,7 +20,6 @@ import (
 	"papermark/internal/harness/tools"
 	"papermark/internal/models"
 	"papermark/internal/models/queries"
-	"papermark/internal/safehttp"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -62,20 +61,20 @@ var ErrNoTaskCreator = errors.New("schedules: no task creator configured")
 type ScheduleService struct {
 	pool  *pgxpool.Pool
 	tasks TaskCreator
-	web   *safehttp.Client // vets the urls of watch rules
+	draft Completer
 }
 
 // NewScheduleService constructs a ScheduleService. Slots are computed in each
 // schedule owner's time zone.
 func NewScheduleService(pool *pgxpool.Pool) *ScheduleService {
-	return &ScheduleService{pool: pool, web: safehttp.New(safehttp.Config{})}
+	return &ScheduleService{pool: pool}
 }
 
 // SetTaskCreator wires the service that creates tasks for runs.
 func (s *ScheduleService) SetTaskCreator(tc TaskCreator) { s.tasks = tc }
 
-// SetWebClient replaces the client that vets watch urls (it carries the server's own host).
-func (s *ScheduleService) SetWebClient(c *safehttp.Client) { s.web = c }
+// SetDrafter wires the cheap model that turns a sentence into a routine draft.
+func (s *ScheduleService) SetDrafter(c Completer) { s.draft = c }
 
 // ScheduleFields are the user-editable fields of a schedule.
 type ScheduleFields struct {
@@ -88,8 +87,7 @@ type ScheduleFields struct {
 	Time      string
 	Weekday   *int
 	Enabled   bool
-	// Trigger is time (the default), email or watch; Rule is the JSON of the
-	// EmailRule or WatchRule of the latter two.
+	// Trigger is time (the default) or email; Rule is the JSON of the EmailRule.
 	Trigger        string
 	Rule           json.RawMessage
 	MaxRunsPerHour int
@@ -127,7 +125,7 @@ func (s *ScheduleService) write(ctx context.Context, sc *models.Schedule, f Sche
 	if f.Trigger == "" {
 		f.Trigger = models.TriggerTime
 	}
-	rule, err := s.normalizeRule(ctx, f.Trigger, f.Rule)
+	rule, err := normalizeRule(f.Trigger, f.Rule)
 	if err != nil {
 		return err
 	}
@@ -161,7 +159,7 @@ func (s *ScheduleService) write(ctx context.Context, sc *models.Schedule, f Sche
 				return err
 			}
 		}
-		return syncTrigger(ctx, tx, sc, true)
+		return syncTrigger(ctx, tx, sc)
 	})
 }
 
@@ -169,8 +167,6 @@ func triggerLimit(trigger string) int {
 	switch trigger {
 	case models.TriggerEmail:
 		return MaxEmailRoutines
-	case models.TriggerWatch:
-		return MaxWatchRoutines
 	}
 	return 0
 }
@@ -191,7 +187,7 @@ func (s *ScheduleService) Delete(ctx context.Context, user, id uuid.UUID) error 
 		if err := queries.SoftDeleteSchedule(ctx, tx, user, id); err != nil {
 			return err
 		}
-		return syncTrigger(ctx, tx, sc, false)
+		return syncTrigger(ctx, tx, sc)
 	})
 }
 
@@ -299,7 +295,7 @@ func apply(sc *models.Schedule, f ScheduleFields, now time.Time, loc *time.Locat
 			f.Title = BriefTitle
 		}
 	}
-	if strings.TrimSpace(f.Prompt) == "" && f.Trigger != models.TriggerWatch {
+	if strings.TrimSpace(f.Prompt) == "" {
 		return fmt.Errorf("%w: prompt is required", ErrInvalidSchedule)
 	}
 	if strings.TrimSpace(f.Title) == "" && f.Prompt != "" {

@@ -17,7 +17,6 @@ import (
 const (
 	TriggerTime  = "time"
 	TriggerEmail = "email"
-	TriggerWatch = "watch"
 )
 
 // MailboxPoll schedules the checks of one Gmail account. A row exists only
@@ -39,8 +38,7 @@ type MailboxPoll struct {
 // TableName for GORM.
 func (MailboxPoll) TableName() string { return "mailbox_polls" }
 
-// TriggerEvent records that a routine fired for SourceKey (a Gmail message id,
-// or the fingerprint of a watched value). The unique (routine, source key)
+// TriggerEvent records that a routine fired for SourceKey (a Gmail message id). The unique (routine, source key)
 // pair makes a replayed check create nothing. TaskID is nil when the update
 // was written without a model run.
 type TriggerEvent struct {

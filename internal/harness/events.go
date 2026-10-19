@@ -52,6 +52,7 @@ type (
 		Attachments []string `json:"attachments"`
 	}
 	UpdateEvent = tools.UpdateEvent // publish_update emits it
+	CardEvent   = tools.CardEvent   // flight tools and checkouts emit it
 	IdleEvent   struct {
 		Type  string   `json:"type"`
 		Text  string   `json:"text"`
@@ -118,7 +119,10 @@ func (h *Harness) tx(ctx context.Context, db Beginner, taskID uuid.UUID, load fu
 			}
 			json.Unmarshal(em.raw, &em.head)
 			status, ok := statusAfter[em.head.Type]
-			if !ok {
+			switch {
+			case em.head.Type == "card":
+				status = task.Status // a card, even one from the app, never changes what the task is doing
+			case !ok:
 				status = models.TaskRunning
 			}
 			if em.seq, err = queries.AppendTaskEvent(ctx, tx, taskID, status, em.head.Type, em.raw); err != nil {

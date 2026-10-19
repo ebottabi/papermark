@@ -373,10 +373,10 @@ func TestOAuthCallbackRejectsExpiredAndDeniedStates(t *testing.T) {
 	q = p.approve(t, body.data()["authorizationUrl"].(string))
 	q.Del("code")
 	q.Set("error", "access_denied")
-	if got := callback(t, api, q); got.Get("status") != "error" || got.Get("connector") != "notes" {
+	if got := callback(t, api, q); got.Get("status") != "error" || got.Get("connector") != "notes" || got.Get("reason") != "Google access wasn't allowed, so nothing was connected." {
 		t.Fatalf("denied: %v", got)
 	}
-	if got := callback(t, api, url.Values{"code": {"x"}, "state": {"forged"}}); got.Get("status") != "error" {
+	if got := callback(t, api, url.Values{"code": {"x"}, "state": {"forged"}}); got.Get("status") != "error" || got.Get("reason") != "That sign-in expired. Start it again from Keen." {
 		t.Fatalf("forged state: %v", got)
 	}
 }

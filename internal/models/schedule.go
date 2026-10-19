@@ -27,8 +27,8 @@ const DefaultMaxRunsPerHour = 10
 const RoutineFailureLimit = 3
 
 // Schedule creates a task from Prompt on a repeating slot in its owner's
-// time zone (Trigger time), or when mail arrives or a watched page changes
-// (Trigger email or watch; Rule holds the JSON of the rule and the slot fields
+// time zone (Trigger time), or when matching mail arrives
+// (Trigger email; Rule holds the JSON of the rule and the slot fields
 // are empty). NextRunAt is nil while the schedule is disabled and for triggers
 // other than time.
 type Schedule struct {

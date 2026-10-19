@@ -47,6 +47,12 @@ func ListUpdates(ctx context.Context, db DBTX, userID uuid.UUID, before *time.Ti
 		ORDER BY created_at DESC, id DESC LIMIT $3`, userID, before, limit)
 }
 
+// LastScheduleUpdate returns the newest update a routine published, of any importance.
+func LastScheduleUpdate(ctx context.Context, db DBTX, scheduleID uuid.UUID) (*models.Update, error) {
+	return scanUpdate(db.QueryRow(ctx, `SELECT `+updateColumns+` FROM updates
+		WHERE schedule_id = $1 ORDER BY created_at DESC, id DESC LIMIT 1`, scheduleID))
+}
+
 // CountPushUpdatesSince counts the push updates userID got in [from, to).
 func CountPushUpdatesSince(ctx context.Context, db DBTX, userID uuid.UUID, from, to time.Time) (n int, err error) {
 	err = db.QueryRow(ctx, `SELECT count(*) FROM updates WHERE user_id = $1 AND importance = 'push'

@@ -10,6 +10,7 @@ import (
 	"errors"
 	"log"
 	"net/url"
+	"strings"
 
 	"papermark/internal/handlers"
 	"papermark/internal/middleware"
@@ -104,8 +105,26 @@ func (c *ConnectorController) Callback(ctx *fiber.Ctx) error {
 	if err != nil {
 		log.Printf("oauth callback: %v", err)
 		q.Set("status", models.ConnectorError)
+		if r := callbackReason(err); r != "" {
+			q.Set("reason", r)
+		}
 	}
 	return ctx.Redirect("keen://oauth?"+q.Encode(), fiber.StatusFound)
+}
+
+// callbackReason says in a sentence why a sign-in failed, for the app to show;
+// "" when the app's generic message fits.
+func callbackReason(err error) string {
+	msg := err.Error()
+	switch {
+	case errors.Is(err, services.ErrInvalidOAuthState):
+		return "That sign-in expired. Start it again from Keen."
+	case strings.HasPrefix(msg, "authorization denied"):
+		return "Google access wasn't allowed, so nothing was connected."
+	case strings.Contains(msg, "has not been used in project") || strings.Contains(msg, "SERVICE_DISABLED") || strings.Contains(msg, "API has not been"):
+		return "Google hasn't switched this service on for Keen yet. Try again later."
+	}
+	return ""
 }
 
 // AuthorizeAccount handles POST /v1/connectors/:name/accounts/:id/authorize

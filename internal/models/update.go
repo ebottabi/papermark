@@ -21,7 +21,7 @@ const (
 )
 
 // Update is one entry of a user's feed, published by a task through
-// publish_update, or by a watch routine directly (TaskID nil). A push update is also sent to the user's devices.
+// publish_update, or by an email trigger directly (TaskID nil). A push update is also sent to the user's devices.
 type Update struct {
 	ID         uuid.UUID  `gorm:"type:uuid;primary_key"`
 	UserID     uuid.UUID  `gorm:"type:uuid;not null"`

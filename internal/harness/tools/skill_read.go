@@ -15,6 +15,8 @@ import (
 	"strings"
 
 	"papermark/internal/harness/skills"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // SkillRead gives the agent a skill's full instructions. Its description
@@ -33,7 +35,7 @@ func SkillRead(list []skills.Skill) Tool {
 	}
 }
 
-func skillRead(_ context.Context, env *Env, input json.RawMessage) (Output, error) {
+func skillRead(ctx context.Context, env *Env, input json.RawMessage) (Output, error) {
 	var in struct{ Name string }
 	if err := json.Unmarshal(input, &in); err != nil {
 		return Output{}, err
@@ -43,5 +45,42 @@ func skillRead(_ context.Context, env *Env, input json.RawMessage) (Output, erro
 	if i < 0 {
 		return Output{Text: fmt.Sprintf("No skill named %q.", name), IsError: true}, nil
 	}
+	if env.TaskTx != nil {
+		err := env.TaskTx(ctx, func(_ pgx.Tx, emit func(any) error) error {
+			return emit(SkillsInUse(env.Skills, []string{name}))
+		})
+		if err != nil {
+			return Output{}, err
+		}
+	}
 	return Output{Text: env.Skills[i].Instructions}, nil
+}
+
+// SkillUse is a skill as the app shows it: a readable title and what it does.
+type SkillUse struct {
+	Name        string `json:"name"`
+	Title       string `json:"title"`
+	Description string `json:"description"`
+}
+
+// SkillsEvent tells the app which skills Keen is following.
+type SkillsEvent struct {
+	Type   string     `json:"type"`
+	Skills []SkillUse `json:"skills"`
+}
+
+// SkillsInUse describes names from list; a name missing from list keeps only its title.
+func SkillsInUse(list []skills.Skill, names []string) SkillsEvent {
+	out := make([]SkillUse, len(names))
+	for i, n := range names {
+		title := strings.ReplaceAll(n, "-", " ")
+		if title != "" {
+			title = strings.ToUpper(title[:1]) + title[1:]
+		}
+		out[i] = SkillUse{Name: n, Title: title}
+		if j := slices.IndexFunc(list, func(s skills.Skill) bool { return s.Name == n }); j >= 0 {
+			out[i].Description = list[j].Description
+		}
+	}
+	return SkillsEvent{"skills", out}
 }

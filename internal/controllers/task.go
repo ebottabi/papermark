@@ -38,6 +38,11 @@ var contentTypes = map[string]string{
 	".json": "application/json", ".html": "text/html; charset=utf-8", ".pdf": "application/pdf",
 	".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif",
 	".webp": "image/webp", ".svg": "image/svg+xml", ".zip": "application/zip",
+	".heic": "image/heic", ".tsv": "text/tab-separated-values; charset=utf-8",
+	".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+	".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+	".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+	".mp3":  "audio/mpeg", ".m4a": "audio/mp4", ".wav": "audio/wav", ".mp4": "video/mp4", ".mov": "video/quicktime",
 }
 
 // TaskController serves /tasks and /usage.

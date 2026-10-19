@@ -218,20 +218,4 @@ func (w *Web) searchResults(ctx context.Context, query string, n int) ([]searchR
 // CanSearch says whether web_search is configured.
 func (w *Web) CanSearch() bool { return w != nil && w.tavilyKey != "" }
 
-// SearchURLs returns the result URLs of a web search, for watch routines.
-func (w *Web) SearchURLs(ctx context.Context, query string) ([]string, error) {
-	if !w.CanSearch() {
-		return nil, errors.New("web search is not configured")
-	}
-	results, err := w.searchResults(ctx, query, maxResults)
-	if err != nil {
-		return nil, err
-	}
-	urls := make([]string, 0, len(results))
-	for _, r := range results {
-		urls = append(urls, r.URL)
-	}
-	return urls, nil
-}
-
 func oneLine(s string) string { return strings.Join(strings.Fields(s), " ") }

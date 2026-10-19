@@ -43,6 +43,19 @@ type Tool struct {
 	Run           func(ctx context.Context, env *Env, input json.RawMessage) (Output, error)
 }
 
+// MediaReader turns workspace images, audio and video into text for the
+// model. Paths are absolute and already inside the workspace.
+type MediaReader interface {
+	// Image describes an image and copies any text in it; a non-empty
+	// question asks about one detail instead.
+	Image(ctx context.Context, path, question string) (string, error)
+	// Audio transcribes speech with timestamps.
+	Audio(ctx context.Context, path string) (string, error)
+	// Video returns a timeline of frames and speech; a non-empty at
+	// ("02:30") describes the single frame at that time instead.
+	Video(ctx context.Context, path, at string) (string, error)
+}
+
 // Env is what one task's tools run against.
 type Env struct {
 	Workspace  string
@@ -52,7 +65,9 @@ type Env struct {
 	DB         queries.DBTX
 	Web        *Web
 	Routines   RoutineCreator // nil: no routine_create
+	Flights    Flights        // nil: no flight tools
 	Skills     []skills.Skill // what skill_read offers, sorted by name
+	Media      MediaReader    // nil: images, audio and video can't be read
 	// Notify adds a notify event to the task.
 	Notify func(ctx context.Context, text string) error
 	// TaskTx runs fn in the task's locked transaction; events emitted in fn
@@ -73,6 +88,12 @@ func Offered(env *Env, routineRun bool) []Tool {
 	}
 	if env.Routines != nil && !routineRun {
 		out = append(out, RoutineCreate)
+	}
+	if env.Flights != nil {
+		out = append(out, FlightSearch, FlightOffer, FlightCheckout, BookingGet)
+		if env.Flights.CanBook() {
+			out = append(out, FlightBook)
+		}
 	}
 	return out
 }

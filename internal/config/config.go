@@ -40,10 +40,11 @@ type Config struct {
 	// TokenKey encrypts OAuth tokens at rest (AES-256-GCM); nil stores them in plaintext.
 	TokenKey []byte
 
-	Agent  AgentConfig
-	Worker WorkerConfig
-	APNS   APNSConfig
-	Ntfy   NtfyConfig
+	Agent   AgentConfig
+	Worker  WorkerConfig
+	APNS    APNSConfig
+	Ntfy    NtfyConfig
+	Flights FlightsConfig
 
 	// Connectors is the fixed catalog the app offers, by connector name.
 	Connectors map[string]ConnectorConfig
@@ -86,6 +87,22 @@ type APNSConfig struct {
 	Topic   string
 }
 
+// FlightsConfig is flight search and booking. Flights are off without a Duffel
+// token. PaymentsMode is "off" (hold or hand off only), "pay" (Keen collects
+// payment with Stripe) or "balance" (the agent books and pays from the Duffel
+// balance with no card, Stripe fields unused). Stripe fields are read only in
+// pay mode. MaxAmountMinor is a currency-agnostic safety ceiling in Stripe minor
+// units; a payment over it is refused.
+type FlightsConfig struct {
+	DuffelToken         string
+	DuffelURL           string
+	PaymentsMode        string
+	StripeKey           string
+	StripeURL           string
+	StripeWebhookSecret string
+	MaxAmountMinor      int64
+}
+
 // NtfyConfig is the ntfy server. Delivery is off unless URL, TopicPrefix and
 // TopicSecret (or TOKEN_ENCRYPTION_KEY) are set.
 type NtfyConfig struct {
@@ -110,6 +127,15 @@ type AgentConfig struct {
 	ModelTimeout     time.Duration
 	ModelMaxRetries  int
 	TavilyAPIKey     string
+	Media            MediaConfig
+}
+
+// MediaConfig configures reading images, audio and video.
+type MediaConfig struct {
+	VisionModel     string
+	TranscribeURL   string
+	TranscribeModel string
+	FFmpeg, FFprobe string
 }
 
 // WorkerConfig configures the background job worker.
@@ -161,6 +187,13 @@ func Load() *Config {
 			ModelTimeout:     time.Duration(getEnvInt("AGENT_MODEL_TIMEOUT_SECONDS", 120)) * time.Second,
 			ModelMaxRetries:  getEnvInt("AGENT_MODEL_MAX_RETRIES", 2),
 			TavilyAPIKey:     getEnv("TAVILY_API_KEY", ""),
+			Media: MediaConfig{
+				VisionModel:     getEnv("AGENT_VISION_MODEL", "accounts/fireworks/models/qwen3p7-plus"),
+				TranscribeURL:   getEnv("AGENT_TRANSCRIBE_URL", "https://audio-prod.us-virginia-1.direct.fireworks.ai/v1/audio/transcriptions"),
+				TranscribeModel: getEnv("AGENT_TRANSCRIBE_MODEL", "whisper-v3"),
+				FFmpeg:          getEnv("FFMPEG_PATH", "ffmpeg"),
+				FFprobe:         getEnv("FFPROBE_PATH", "ffprobe"),
+			},
 		},
 
 		Auth: AuthConfig{
@@ -192,6 +225,16 @@ func Load() *Config {
 			Token:       getEnv("NTFY_TOKEN", ""),
 		},
 
+		Flights: FlightsConfig{
+			DuffelToken:         getEnv("DUFFEL_ACCESS_TOKEN", ""),
+			DuffelURL:           strings.TrimRight(getEnv("DUFFEL_API_URL", "https://api.duffel.com"), "/"),
+			PaymentsMode:        getEnv("PAYMENTS_MODE", "off"),
+			StripeKey:           getEnv("STRIPE_SECRET_KEY", ""),
+			StripeURL:           strings.TrimRight(getEnv("STRIPE_API_URL", "https://api.stripe.com"), "/"),
+			StripeWebhookSecret: getEnv("STRIPE_WEBHOOK_SECRET", ""),
+			MaxAmountMinor:      int64(getEnvInt("FLIGHTS_MAX_AMOUNT", 500000)),
+		},
+
 		Connectors: map[string]ConnectorConfig{
 			"gmail": {
 				Kind:         "gmail",
@@ -220,7 +263,7 @@ func Load() *Config {
 				AuthParams: map[string]string{"access_type": "offline", "prompt": "consent"},
 			},
 			// Read-only Google Contacts (People API), synced into Postgres in the background.
-			// userinfo.email lets people/me name the address that signed in.
+			// people/me needs profile, and userinfo.email lets it name the address that signed in.
 			"contacts": {
 				Kind:         "contacts",
 				URL:          getEnv("CONTACTS_API_URL", "https://people.googleapis.com"),
@@ -230,7 +273,7 @@ func Load() *Config {
 				ClientID:     getEnv("CONTACTS_CLIENT_ID", getEnv("GMAIL_CLIENT_ID", "")),
 				ClientSecret: getEnv("CONTACTS_CLIENT_SECRET", getEnv("GMAIL_CLIENT_SECRET", "")),
 				Scopes: strings.Fields(getEnv("CONTACTS_SCOPES",
-					"https://www.googleapis.com/auth/contacts.readonly https://www.googleapis.com/auth/contacts.other.readonly https://www.googleapis.com/auth/userinfo.email")),
+					"https://www.googleapis.com/auth/contacts.readonly https://www.googleapis.com/auth/contacts.other.readonly https://www.googleapis.com/auth/userinfo.email profile")),
 				AuthParams: map[string]string{"access_type": "offline", "prompt": "consent"},
 			},
 			// Read-only Google Drive (Drive API v3).

@@ -50,6 +50,8 @@ type Harness struct {
 	Connectors ConnectorProvider
 	Notifier   Notifier
 	Routines   tools.RoutineCreator
+	Flights    tools.Flights     // nil: no flight tools
+	Media      tools.MediaReader // nil: images, audio and video can't be read
 	Preparer   Preparer
 
 	pool       *pgxpool.Pool
@@ -180,9 +182,4 @@ func (h *Harness) Complete(ctx context.Context, system, prompt string, maxTokens
 		}
 	}
 	return "", errors.New("the model is unavailable")
-}
-
-// SearchURLs returns the result URLs of a web search, for watch routines.
-func (h *Harness) SearchURLs(ctx context.Context, query string) ([]string, error) {
-	return h.web.SearchURLs(ctx, query)
 }

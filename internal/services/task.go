@@ -128,7 +128,7 @@ func (s *TaskService) queue(ctx context.Context, tx pgx.Tx, emit harness.Emit, i
 		return err
 	}
 	if len(files) > 0 {
-		text += "\n\nAttached files (workspace paths): " + strings.Join(files, ", ")
+		text += "\n\nAttached files (workspace paths): " + strings.Join(s.describe(id, files), ", ")
 	}
 	return queries.InsertTaskInbox(ctx, tx, id, text)
 }
@@ -261,6 +261,41 @@ func (s *TaskService) withContext(ctx context.Context, user uuid.UUID, project *
 	return strings.Join(parts, "\n\n") + "\n\nTask:\n" + text, nil
 }
 
+var unsafeExts = map[string]bool{".exe": true, ".dll": true, ".so": true, ".dylib": true, ".sh": true, ".bat": true, ".cmd": true, ".com": true, ".msi": true, ".apk": true, ".app": true, ".scpt": true, ".jar": true}
+
+var kinds = map[string]string{
+	".xlsx": "spreadsheet", ".xls": "spreadsheet", ".csv": "table", ".tsv": "table", ".pdf": "PDF", ".docx": "Word document", ".pptx": "presentation",
+	".png": "image", ".jpg": "image", ".jpeg": "image", ".gif": "image", ".webp": "image", ".heic": "image",
+	".mp3": "audio", ".m4a": "audio", ".wav": "audio", ".aac": "audio", ".ogg": "audio", ".flac": "audio",
+	".mp4": "video", ".mov": "video", ".m4v": "video", ".webm": "video",
+	".txt": "text", ".md": "text", ".json": "text",
+}
+
+// describe adds each upload's type and size to its workspace path.
+func (s *TaskService) describe(id uuid.UUID, files []string) []string {
+	out := make([]string, len(files))
+	for i, f := range files {
+		out[i] = f
+		info, err := os.Stat(filepath.Join(s.s.Harness.Workspace(id), f))
+		if err != nil {
+			continue
+		}
+		kind, ok := kinds[strings.ToLower(path.Ext(f))]
+		if !ok {
+			kind = "file"
+		}
+		size := fmt.Sprintf("%d B", info.Size())
+		switch n := float64(info.Size()); {
+		case n >= 1<<20:
+			size = fmt.Sprintf("%.1f MB", n/(1<<20))
+		case n >= 1<<10:
+			size = fmt.Sprintf("%.1f KB", n/(1<<10))
+		}
+		out[i] = fmt.Sprintf("%s (%s, %s)", f, kind, size)
+	}
+	return out
+}
+
 // saveAttachments writes base64 attachments under the workspace's uploads/,
 // never overwriting, and returns their workspace paths.
 func (s *TaskService) saveAttachments(id uuid.UUID, raw json.RawMessage) ([]string, error) {
@@ -280,6 +315,9 @@ func (s *TaskService) saveAttachments(id uuid.UUID, raw json.RawMessage) ([]stri
 		base := path.Base(strings.ReplaceAll(name, "\\", "/"))
 		if !ok1 || !ok2 || name == "" || base == "." || base == ".." || base == "/" {
 			return nil, invalid
+		}
+		if unsafeExts[strings.ToLower(path.Ext(base))] {
+			return nil, badRequest("%s: executable files can't be attached", base)
 		}
 		files = append(files, Attachment{base, b64})
 	}
@@ -430,6 +468,25 @@ func (s *TaskService) Message(ctx context.Context, user, id uuid.UUID, text stri
 			return err
 		}
 		return s.start(ctx, tx, emit, id, text, expanded, files)
+	})
+	if err == nil {
+		s.s.Jobs.Notify()
+	}
+	return err
+}
+
+// Note tells the task's agent something the user did outside the chat. A
+// running or waiting task reads it silently; a finished one continues, with
+// shown as the short message in the chat.
+func (s *TaskService) Note(ctx context.Context, user, id uuid.UUID, shown, text string) error {
+	err := s.ownedTx(ctx, user, id, func(tx pgx.Tx, t *models.Task, emit harness.Emit) error {
+		if t.Status == models.TaskRunning || t.Status == models.TaskWaiting {
+			return queries.InsertTaskInbox(ctx, tx, id, text)
+		}
+		if err := queries.SetTaskStopRequested(ctx, tx, id, false); err != nil {
+			return err
+		}
+		return s.start(ctx, tx, emit, id, shown, text, []string{})
 	})
 	if err == nil {
 		s.s.Jobs.Notify()

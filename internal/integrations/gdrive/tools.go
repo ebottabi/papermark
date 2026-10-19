@@ -20,6 +20,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"papermark/internal/docs"
 	"papermark/internal/storage"
 )
 
@@ -457,7 +458,7 @@ func text(ctx context.Context, c *Client, f *File, chars int) (string, string, e
 			return "", "", tooLarge(err)
 		}
 		// Four bytes a character bounds the pages parsed past the cut.
-		t, err := pdfText(data, chars*4)
+		t, err := docs.PDFText(data, chars*4)
 		if err == nil && strings.TrimSpace(t) == "" {
 			note = "The PDF has no text layer (it may be scanned images)."
 		}
@@ -466,7 +467,7 @@ func text(ctx context.Context, c *Client, f *File, chars int) (string, string, e
 		if data, err = c.Media(ctx, f.ID, maxFile); err != nil {
 			return "", "", tooLarge(err)
 		}
-		t, err := docxText(data)
+		t, err := docs.DocxText(data)
 		return t, "", err
 	case f.MimeType == folderMime:
 		return "", "", errors.New("cannot read a folder; use search to list files")

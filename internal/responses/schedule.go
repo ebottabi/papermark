@@ -19,7 +19,6 @@ type ScheduleDTO struct {
 	Title     string  `json:"title"`
 	Kind      string  `json:"kind"`
 	Prompt    string  `json:"prompt"`
-	Mode      string  `json:"mode"`
 	ProjectID *string `json:"projectId"`
 	Repeat    *string `json:"repeat"`
 	Time      *string `json:"time"`
@@ -29,9 +28,8 @@ type ScheduleDTO struct {
 	NextRunAt *string `json:"nextRunAt"`
 	CreatedAt string  `json:"createdAt"`
 	Trigger   string  `json:"trigger"`
-	// Rule is the email or watch rule; null for time routines.
-	Rule           json.RawMessage `json:"rule"`
-	MaxRunsPerHour int             `json:"maxRunsPerHour"`
+	// Rule is the email rule; null for time routines.
+	Rule json.RawMessage `json:"rule"`
 }
 
 // TriggerEventDTO is one entry of a routine's trigger history.
@@ -59,9 +57,9 @@ func TriggerEventsResponse(es []*models.TriggerEvent) []TriggerEventDTO {
 // ScheduleResponse maps a schedule onto its DTO.
 func ScheduleResponse(s *models.Schedule) ScheduleDTO {
 	d := ScheduleDTO{
-		ID: s.ID.String(), Title: s.Title, Kind: s.Kind, Prompt: s.Prompt, Mode: s.Mode,
+		ID: s.ID.String(), Title: s.Title, Kind: s.Kind, Prompt: s.Prompt,
 		Weekday: s.Weekday, Enabled: s.Enabled, LastRunAt: optTime(s.LastRunAt), NextRunAt: optTime(s.NextRunAt),
-		CreatedAt: Time(s.CreatedAt), Trigger: s.Trigger, MaxRunsPerHour: s.MaxRunsPerHour,
+		CreatedAt: Time(s.CreatedAt), Trigger: s.Trigger,
 	}
 	if s.Trigger == "" || s.Trigger == "time" {
 		d.Trigger, d.Repeat, d.Time = "time", &s.Repeat, &s.TimeOfDay

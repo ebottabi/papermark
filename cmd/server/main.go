@@ -67,6 +67,10 @@ func main() {
 	}
 
 	svcs := services.New(cfg, pool, redisClient)
+	var flights *controllers.FlightController
+	if svcs.Flights != nil {
+		flights = controllers.NewFlightController(svcs.Flights)
+	}
 
 	app := router.New(&router.Config{
 		Authenticate: svcs.Auth.Authenticate,
@@ -85,6 +89,7 @@ func main() {
 		Prefs:        controllers.NewPreferencesController(svcs.Prefs),
 		Updates:      controllers.NewUpdateController(svcs.Updates),
 		Memories:     controllers.NewMemoryController(svcs.Memories),
+		Flights:      flights,
 	})
 
 	workerCtx, workerCancel := context.WithCancel(context.Background())

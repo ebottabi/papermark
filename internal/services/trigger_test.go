@@ -18,14 +18,34 @@ import (
 	"papermark/internal/models/queries"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 func emailFields(rule string) ScheduleFields {
-	return ScheduleFields{Title: "Mail", Prompt: "handle it", Mode: "quality", Enabled: true, Trigger: "email", Rule: json.RawMessage(rule)}
+	return ScheduleFields{Title: "Mail", Prompt: "handle it", Enabled: true, Trigger: "email", Rule: json.RawMessage(rule)}
+}
+
+type ruleEnv struct {
+	pool     *pgxpool.Pool
+	schedule *ScheduleService
+}
+
+func newRuleEnv(t *testing.T) *ruleEnv {
+	t.Helper()
+	pool, _ := database.NewTestDatabase(t)
+	return &ruleEnv{pool: pool, schedule: NewScheduleService(pool)}
+}
+
+func (e *ruleEnv) count(t *testing.T, table string) (n int) {
+	t.Helper()
+	if err := e.pool.QueryRow(context.Background(), `SELECT count(*) FROM `+table+` WHERE deleted_at IS NULL`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
 }
 
 func TestRuleValidation(t *testing.T) {
-	e := newWatchEnv(t)
+	e := newRuleEnv(t)
 	user := testUser(t, e.pool)
 	ctx := context.Background()
 	cases := []struct {
@@ -38,20 +58,8 @@ func TestRuleValidation(t *testing.T) {
 		{"email rule with only account", emailFields(`{"account":"me@example.com"}`), "at least one"},
 		{"email rule blank fields", emailFields(`{"from":"  "}`), "at least one"},
 		{"email rule not json", emailFields(`[1]`), "not valid"},
-		{"unknown trigger", ScheduleFields{Title: "x", Prompt: "p", Mode: "quality", Trigger: "sms", Rule: json.RawMessage(`{}`)}, "trigger must be"},
-		{"watch page without url", watchFields(`{"kind":"page","condition":"changed"}`), "needs a url"},
-		{"watch search without query", watchFields(`{"kind":"search","condition":"newItems"}`), "needs a query"},
-		{"watch bad kind", watchFields(`{"kind":"rss","url":"https://example.com","condition":"changed"}`), "kind must be"},
-		{"watch bad condition", watchFields(`{"kind":"page","url":"https://example.com","condition":"gone"}`), "condition must be"},
-		{"below without threshold", watchFields(`{"kind":"page","url":"https://example.com","condition":"below"}`), "needs a threshold"},
-		{"above without threshold", watchFields(`{"kind":"page","url":"https://example.com","condition":"above"}`), "needs a threshold"},
-		{"contains without text", watchFields(`{"kind":"page","url":"https://example.com","condition":"contains"}`), "needs text"},
-		{"interval too long", watchFields(`{"kind":"page","url":"https://example.com","condition":"changed","intervalMinutes":1441}`), "intervalMinutes"},
-		{"interval negative", watchFields(`{"kind":"page","url":"https://example.com","condition":"changed","intervalMinutes":-1}`), "intervalMinutes"},
-		{"loopback url", watchFields(`{"kind":"page","url":"http://127.0.0.1/","condition":"changed"}`), "Keen can only watch public web pages. 127.0.0.1 is a private address."},
-		{"localhost url", watchFields(`{"kind":"page","url":"http://localhost:8080/x","condition":"changed"}`), "Keen can only watch public web pages. localhost is a private address."},
-		{"metadata url", watchFields(`{"kind":"page","url":"http://169.254.169.254/latest","condition":"changed"}`), "public web pages"},
-		{"file url", watchFields(`{"kind":"page","url":"file:///etc/passwd","condition":"changed"}`), "starts with http:// or https://"},
+		{"unknown trigger", ScheduleFields{Title: "x", Prompt: "p", Trigger: "sms", Rule: json.RawMessage(`{}`)}, "trigger must be"},
+		{"watch is gone", ScheduleFields{Title: "W", Prompt: "p", Trigger: "watch", Rule: json.RawMessage(`{"kind":"page","url":"https://example.com","condition":"changed"}`)}, "trigger must be time or email"},
 	}
 	for _, c := range cases {
 		_, err := e.schedule.Create(ctx, user, c.f)
@@ -59,39 +67,27 @@ func TestRuleValidation(t *testing.T) {
 			t.Errorf("%s: %v", c.name, err)
 		}
 	}
-	if e.count(t, "schedules") != 0 || e.count(t, "watch_targets") != 0 {
+	if e.count(t, "schedules") != 0 {
 		t.Fatal("a refused routine left rows behind")
 	}
 }
 
-func watchFields(rule string) ScheduleFields {
-	return ScheduleFields{Title: "W", Prompt: "p", Mode: "quality", Enabled: true, Trigger: "watch", Rule: json.RawMessage(rule)}
-}
-
-func TestRuleDefaultsAndMaxRuns(t *testing.T) {
-	e := newWatchEnv(t)
-	user := testUser(t, e.pool)
-	ctx := context.Background()
-	sc, err := e.schedule.Create(ctx, user, watchFields(`{"kind":"page","url":"https://example.com","condition":"changed"}`))
+func TestEmailRuleDefaults(t *testing.T) {
+	e := newRuleEnv(t)
+	sc, err := e.schedule.Create(context.Background(), testUser(t, e.pool), emailFields(`{"smart":"  from my bank about a failed payment "}`))
 	if err != nil {
 		t.Fatal(err)
 	}
-	var r WatchRule
+	var r EmailRule
 	json.Unmarshal(sc.Rule, &r)
-	if r.IntervalMinutes != 1 || sc.MaxRunsPerHour != 10 || sc.Repeat != "" || sc.TimeOfDay != "" || sc.NextRunAt != nil {
-		t.Fatalf("rule=%+v max=%d repeat=%v time=%v next=%v", r, sc.MaxRunsPerHour, sc.Repeat, sc.TimeOfDay, sc.NextRunAt)
-	}
-	for _, n := range []int{-1, 101} {
-		f := watchFields(`{"kind":"page","url":"https://example.com","condition":"changed"}`)
-		f.MaxRunsPerHour = n
-		if _, err := e.schedule.Create(ctx, user, f); !errors.Is(err, ErrInvalidSchedule) {
-			t.Errorf("maxRunsPerHour %d: %v", n, err)
-		}
+	if r.Smart != "from my bank about a failed payment" || sc.Mode != "quality" || sc.MaxRunsPerHour != models.DefaultMaxRunsPerHour ||
+		sc.Repeat != "" || sc.TimeOfDay != "" || sc.NextRunAt != nil {
+		t.Fatalf("rule=%+v mode=%s max=%d repeat=%q time=%q next=%v", r, sc.Mode, sc.MaxRunsPerHour, sc.Repeat, sc.TimeOfDay, sc.NextRunAt)
 	}
 }
 
 func TestRoutineLimitsPerUser(t *testing.T) {
-	e := newWatchEnv(t)
+	e := newRuleEnv(t)
 	ctx := context.Background()
 	a, b := testUser(t, e.pool), testUser(t, e.pool)
 	for i := 0; i < MaxEmailRoutines; i++ {
@@ -105,33 +101,21 @@ func TestRoutineLimitsPerUser(t *testing.T) {
 	if _, err := e.schedule.Create(ctx, b, emailFields(`{"from":"boss@example.com"}`)); err != nil {
 		t.Fatalf("another user is limited by the first: %v", err)
 	}
-	var last *models.Schedule
-	for i := 0; i < MaxWatchRoutines; i++ {
-		rule := `{"kind":"search","query":"topic ` + uuid.NewString() + `","condition":"newItems"}`
-		sc, err := e.schedule.Create(ctx, a, watchFields(rule))
-		if err != nil {
-			t.Fatalf("watch %d: %v", i, err)
-		}
-		last = sc
-	}
-	if _, err := e.schedule.Create(ctx, a, watchFields(`{"kind":"search","query":"one more","condition":"newItems"}`)); !errors.Is(err, ErrInvalidSchedule) {
-		t.Fatalf("21st watch routine: %v", err)
-	}
-	if err := e.schedule.Delete(ctx, a, last.ID); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := e.schedule.Create(ctx, a, watchFields(`{"kind":"search","query":"one more","condition":"newItems"}`)); err != nil {
-		t.Fatalf("a deleted routine still counts: %v", err)
-	}
 	// editing a routine at the limit does not count it twice
 	first, _ := queries.ListEmailRoutines(ctx, e.pool, a)
 	if _, err := e.schedule.Update(ctx, a, first[0].ID, emailFields(`{"from":"other@example.com"}`)); err != nil {
 		t.Fatalf("editing at the limit: %v", err)
 	}
+	if err := e.schedule.Delete(ctx, a, first[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.schedule.Create(ctx, a, emailFields(`{"from":"boss@example.com"}`)); err != nil {
+		t.Fatalf("a deleted routine still counts: %v", err)
+	}
 }
 
 func TestConcurrentCreatesRespectTheLimit(t *testing.T) {
-	e := newWatchEnv(t)
+	e := newRuleEnv(t)
 	ctx := context.Background()
 	user := testUser(t, e.pool)
 	done := make(chan error, 25)
@@ -153,13 +137,17 @@ func TestConcurrentCreatesRespectTheLimit(t *testing.T) {
 }
 
 func TestTriggersAreOwnedByTheRoutinesUser(t *testing.T) {
-	e := newWatchEnv(t)
+	e := newRuleEnv(t)
 	ctx := context.Background()
 	a, b := testUser(t, e.pool), testUser(t, e.pool)
-	r := e.price(t, a, "changed", 0, "")
-	e.poll(t)
-	e.site.price("€1")
-	e.poll(t)
+	r, err := e.schedule.Create(ctx, a, emailFields(`{"from":"boss@example.com"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.pool.Exec(ctx, `INSERT INTO trigger_events (id, routine_id, user_id, source_key, summary, created_at)
+		VALUES ($1, $2, $3, 'm1', 'New mail', now())`, uuid.New(), r.ID, a); err != nil {
+		t.Fatal(err)
+	}
 	got, err := e.schedule.Triggers(ctx, a, r.ID, 30)
 	if err != nil || len(got) != 1 {
 		t.Fatalf("owner: %v %v", got, err)

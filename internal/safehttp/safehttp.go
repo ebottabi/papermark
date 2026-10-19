@@ -219,7 +219,7 @@ func (c *Client) Get(ctx context.Context, raw, accept string, cond Conditions) (
 			return nil, errors.New("not a valid URL")
 		}
 		req.Header.Set("Accept", accept)
-		req.Header.Set("User-Agent", "Keen/1.0 (+page watch)")
+		req.Header.Set("User-Agent", "Keen/1.0")
 		if hop == 0 && cond.ETag != "" {
 			req.Header.Set("If-None-Match", cond.ETag)
 		}

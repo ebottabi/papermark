@@ -38,7 +38,6 @@ type ScheduleRequest struct {
 	Title     *string         `json:"title"`
 	Kind      *string         `json:"kind"`
 	Prompt    *string         `json:"prompt"`
-	Mode      *string         `json:"mode"`
 	ProjectID json.RawMessage `json:"projectId"`
 	Repeat    *string         `json:"repeat"`
 	Time      *string         `json:"time"`
@@ -46,8 +45,7 @@ type ScheduleRequest struct {
 	Enabled   *bool           `json:"enabled"`
 	Trigger   *string         `json:"trigger"`
 	// Rule null clears the rule.
-	Rule           json.RawMessage `json:"rule"`
-	MaxRunsPerHour *int            `json:"maxRunsPerHour"`
+	Rule json.RawMessage `json:"rule"`
 }
 
 // merge applies the fields present in r onto f.
@@ -61,9 +59,6 @@ func (r ScheduleRequest) merge(f services.ScheduleFields) (services.ScheduleFiel
 	if r.Prompt != nil {
 		f.Prompt = *r.Prompt
 	}
-	if r.Mode != nil {
-		f.Mode = *r.Mode
-	}
 	if r.Repeat != nil {
 		f.Repeat = *r.Repeat
 	}
@@ -75,9 +70,6 @@ func (r ScheduleRequest) merge(f services.ScheduleFields) (services.ScheduleFiel
 	}
 	if r.Trigger != nil {
 		f.Trigger = *r.Trigger
-	}
-	if r.MaxRunsPerHour != nil {
-		f.MaxRunsPerHour = *r.MaxRunsPerHour
 	}
 	if r.Rule != nil {
 		f.Rule = r.Rule
@@ -132,6 +124,31 @@ func (c *ScheduleController) Create(ctx *fiber.Ctx) error {
 		return c.sendErr(ctx, err)
 	}
 	return c.SendCreated(ctx, responses.ScheduleResponse(s), "")
+}
+
+// DraftRequest is the body of POST /v1/schedules/draft.
+type DraftRequest struct {
+	Text string `json:"text"`
+}
+
+// Draft handles POST /v1/schedules/draft: it turns one sentence into a routine
+// the app previews before creating it with POST /v1/schedules.
+func (c *ScheduleController) Draft(ctx *fiber.Ctx) error {
+	var req DraftRequest
+	if err := ctx.BodyParser(&req); err != nil {
+		return c.SendBadRequest(ctx, "invalid request body")
+	}
+	d, err := c.scheduleService.Draft(ctx.Context(), middleware.UserID(ctx), req.Text)
+	switch {
+	case errors.Is(err, services.ErrInvalidSchedule):
+		return c.SendBadRequest(ctx, err.Error())
+	case errors.Is(err, services.ErrDraftUnusable):
+		return c.SendError(ctx, fiber.StatusBadGateway, "Keen couldn't turn that into a routine. Try saying what to do and when.", "DRAFT_UNUSABLE")
+	case err != nil:
+		return c.SendError(ctx, fiber.StatusBadGateway, "Keen couldn't draft that routine right now. Try again.", "DRAFT_FAILED")
+	}
+	return c.SendSuccess(ctx, fiber.Map{"draft": d,
+		"summary": fiber.Map{"when": d.When, "does": d.Does, "tells": d.Tells}, "question": d.Question})
 }
 
 // Update handles PATCH /v1/schedules/:id.

@@ -21,7 +21,6 @@ import (
 	"papermark/internal/integrations/gmail"
 	"papermark/internal/models"
 	"papermark/internal/models/queries"
-	"papermark/internal/safehttp"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -44,16 +43,14 @@ type Completer interface {
 	Complete(ctx context.Context, system, prompt string, maxTokens int) (string, error)
 }
 
-// TriggerService runs the routines that fire on mail and on watched pages,
+// TriggerService runs the routines that fire on mail,
 // and the background contacts sync.
 // Every server and worker process may run it: rows are claimed with SKIP
 // LOCKED under a lease, and a replayed check records nothing twice.
 type TriggerService struct {
-	pool   *pgxpool.Pool
-	tasks  TaskCreator
-	model  Completer
-	web    *safehttp.Client
-	search func(ctx context.Context, query string) ([]string, error)
+	pool  *pgxpool.Pool
+	tasks TaskCreator
+	model Completer
 	// client returns the Gmail client of an account; gmail.ErrNeedsAuth when it has no usable sign-in.
 	client func(ctx context.Context, a *models.GmailAccount) (*gmail.Client, error)
 	// onAuth marks an account needs_auth after Google refused its token.

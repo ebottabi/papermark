@@ -70,12 +70,15 @@ func AllModels() []interface{} {
 		// Routine triggers
 		&MailboxPoll{},
 		&TriggerEvent{},
-		&WatchTarget{},
-		&WatchSubscription{},
 
 		// Assistant feed and memory
 		&Update{},
 		&Memory{},
+
+		// Flights
+		&FlightSearch{},
+		&TravellerProfile{},
+		&Checkout{},
 	}
 }
 
@@ -123,6 +126,12 @@ func PostMigrations() []string {
 		`CREATE INDEX IF NOT EXISTS contacts_email_keys ON contacts USING gin (email_keys jsonb_path_ops)`,
 		`CREATE INDEX IF NOT EXISTS contacts_phone_keys ON contacts USING gin (phone_keys jsonb_path_ops)`,
 		`CREATE INDEX IF NOT EXISTS contact_syncs_due ON contact_syncs (next_sync_at)`,
+		// Watch routines were removed; any left are retired with their poll tables.
+		`UPDATE schedules SET deleted_at = now(), enabled = false WHERE trigger = 'watch' AND deleted_at IS NULL`,
+		`DROP TABLE IF EXISTS watch_subscriptions`,
+		`DROP TABLE IF EXISTS watch_targets`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS traveller_profiles_one_self ON traveller_profiles (user_id) WHERE is_self`,
+		`CREATE INDEX IF NOT EXISTS checkouts_user_recent ON checkouts (user_id, created_at DESC)`,
 	}
 }
 

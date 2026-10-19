@@ -18,7 +18,7 @@ import (
 )
 
 func TestBuiltinSkillsLoad(t *testing.T) {
-	want := []string{"bills-and-renewals", "daily-briefing", "expenses", "follow-ups", "inbox-triage", "meeting-follow-up", "meeting-prep", "research-report", "schedule-meeting", "travel-itinerary", "weekly-review", "write-in-my-voice"}
+	want := []string{"bills-and-renewals", "book-flight", "ctf", "daily-briefing", "expenses", "follow-ups", "inbox-triage", "meeting-follow-up", "meeting-prep", "research-report", "s3-pentest-commands", "schedule-meeting", "security-recon", "travel-itinerary", "web-app-pentest", "weekly-review", "write-in-my-voice"}
 	got := Builtin()
 	if len(got) != len(want) {
 		t.Fatalf("got %d skills, want %d", len(got), len(want))

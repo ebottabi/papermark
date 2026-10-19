@@ -14,10 +14,10 @@ import (
 	"papermark/internal/services"
 )
 
-// TriggerInterval is how often RunTriggers looks for mailboxes and pages that are due.
+// TriggerInterval is how often RunTriggers looks for mailboxes that are due.
 const TriggerInterval = 5 * time.Second
 
-// RunTriggers checks due mailboxes, watched pages and contacts syncs every interval until ctx
+// RunTriggers checks due mailboxes and contacts syncs every interval until ctx
 // is cancelled. Every server and worker process may run it: claims use SKIP LOCKED.
 func RunTriggers(ctx context.Context, t *services.TriggerService, interval time.Duration) {
 	// A full contacts sync can take a minute; it runs beside mail so mail triggers stay prompt.
@@ -27,9 +27,6 @@ func RunTriggers(ctx context.Context, t *services.TriggerService, interval time.
 	for {
 		if _, err := t.RunMail(ctx); err != nil && ctx.Err() == nil {
 			log.Printf("triggers: mail: %v", err)
-		}
-		if _, err := t.RunWatch(ctx); err != nil && ctx.Err() == nil {
-			log.Printf("triggers: watch: %v", err)
 		}
 		select {
 		case <-ctx.Done():

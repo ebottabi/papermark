@@ -49,6 +49,7 @@ type Config struct {
 	Prefs       *controllers.PreferencesController
 	Updates     *controllers.UpdateController
 	Memories    *controllers.MemoryController
+	Flights     *controllers.FlightController // nil: no flight routes
 }
 
 // New builds the Fiber app: error envelope, recover, logger, CORS, /health,
@@ -129,6 +130,7 @@ func Setup(app *fiber.App, cfg *Config) {
 	api := app.Group("/v1")
 
 	setupOAuthCallbackRoute(api, cfg)
+	setupPayReturnRoute(api, cfg)
 	setupPublicAuthRoutes(api, cfg)
 
 	protected := api.Group("")
@@ -144,6 +146,7 @@ func Setup(app *fiber.App, cfg *Config) {
 	setupProjectRoutes(protected, cfg)
 	setupDeviceRoutes(protected, cfg)
 	setupScheduleRoutes(protected, cfg)
+	setupFlightRoutes(protected, cfg)
 	setupConnectorRoutes(protected, cfg)
 	setupGmailLabelRoutes(protected, cfg)
 	setupAuthRoutes(protected, cfg)
@@ -256,10 +259,33 @@ func setupScheduleRoutes(api fiber.Router, cfg *Config) {
 	}
 	api.Get("/schedules", cfg.Schedules.List)
 	api.Post("/schedules", cfg.Schedules.Create)
+	api.Post("/schedules/draft", cfg.Schedules.Draft)
 	api.Patch("/schedules/:id", cfg.Schedules.Update)
 	api.Delete("/schedules/:id", cfg.Schedules.Delete)
 	api.Post("/schedules/:id/run", cfg.Schedules.Run)
 	api.Get("/schedules/:id/triggers", cfg.Schedules.Triggers)
+}
+
+func setupFlightRoutes(api fiber.Router, cfg *Config) {
+	f := cfg.Flights
+	if f == nil {
+		return
+	}
+	api.Get("/flights/searches/:id/offers", f.Offers)
+	api.Get("/flights/searches/:id/offers/:ref", f.Offer)
+	api.Post("/checkouts", f.CreateCheckout)
+	api.Get("/checkouts/:id", f.GetCheckout)
+	api.Patch("/checkouts/:id", f.PatchCheckout)
+	api.Get("/checkouts/:id/extras", f.Extras)
+	api.Post("/checkouts/:id/hold", f.Hold)
+	api.Post("/checkouts/:id/handoff", f.Handoff)
+	api.Post("/checkouts/:id/pay", f.Pay)
+	api.Post("/checkouts/:id/pay/confirm", f.ConfirmPay)
+	api.Get("/trips", f.Trips)
+	api.Get("/travellers", f.Travellers)
+	api.Post("/travellers", f.CreateTraveller)
+	api.Patch("/travellers/:id", f.PatchTraveller)
+	api.Delete("/travellers/:id", f.DeleteTraveller)
 }
 
 // setupOAuthCallbackRoute registers the public OAuth redirect target; it
@@ -269,6 +295,15 @@ func setupOAuthCallbackRoute(api fiber.Router, cfg *Config) {
 		return
 	}
 	api.Get("/oauth/callback", middleware.RateLimit(30, time.Minute), cfg.Connectors.Callback)
+}
+
+// setupPayReturnRoute registers the public Stripe return target; like the OAuth
+// callback it sits outside bearer auth and is rate limited per IP.
+func setupPayReturnRoute(api fiber.Router, cfg *Config) {
+	if cfg.Flights == nil {
+		return
+	}
+	api.Get("/checkouts/pay/return", middleware.RateLimit(30, time.Minute), cfg.Flights.PayReturn)
 }
 
 func setupConnectorRoutes(api fiber.Router, cfg *Config) {

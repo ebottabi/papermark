@@ -13,14 +13,18 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
+	"time"
 
 	"papermark/internal/cache"
 	"papermark/internal/config"
 	"papermark/internal/harness"
+	"papermark/internal/integrations/duffel"
+	"papermark/internal/integrations/media"
+	"papermark/internal/integrations/stripe"
 	"papermark/internal/models/queries"
 	"papermark/internal/notifications"
 	"papermark/internal/notifications/apns"
-	"papermark/internal/safehttp"
 	"papermark/internal/secretbox"
 	"papermark/internal/services/jobs"
 
@@ -47,6 +51,7 @@ type Services struct {
 	MCP       *ConnectorService
 	Auth      *AuthService
 	Triggers  *TriggerService
+	Flights   *FlightService // nil without DUFFEL_ACCESS_TOKEN
 }
 
 // New wires the services. rdb may be nil (single-process mode: the bus is in-process).
@@ -77,6 +82,9 @@ func New(cfg *config.Config, pool *pgxpool.Pool, rdb *redis.Client) *Services {
 		log.Println("WARNING: ntfy is off: NTFY_TOPIC and NTFY_TOPIC_SECRET (or TOKEN_ENCRYPTION_KEY) are required")
 	}
 	s.Harness.Routines = s.Schedules
+	if cfg.Agent.FireworksAPIKey != "" {
+		s.Harness.Media = media.New(cfg.Agent)
+	}
 	s.Updates = NewUpdateService(pool)
 	s.Memories = NewMemoryService(pool)
 	s.Tasks = &TaskService{pool: pool, s: s}
@@ -85,16 +93,29 @@ func New(cfg *config.Config, pool *pgxpool.Pool, rdb *redis.Client) *Services {
 	s.Knowledge = &KnowledgeService{pool: pool}
 	s.Skills = &SkillService{pool: pool}
 	s.Schedules.SetTaskCreator(s.Tasks)
-	limiter := safehttp.NewLimiter(safehttp.HostInterval)
-	s.Schedules.SetWebClient(safehttp.New(safehttp.Config{DenyHosts: []string{cfg.Agent.PublicHost}, Limiter: limiter}))
 	s.Triggers = NewTriggerService(pool, s.Tasks)
 	s.Triggers.model = s.Harness
-	s.Triggers.web = safehttp.New(safehttp.Config{DenyHosts: []string{cfg.Agent.PublicHost}, Limiter: limiter})
-	s.Triggers.search = s.Harness.SearchURLs
+	s.Schedules.SetDrafter(s.Harness)
 	s.Triggers.client = s.MCP.MailClient
 	s.Triggers.onAuth = s.MCP.markAccountNeedsAuth
 	s.Triggers.contacts = s.MCP.RunContacts
 	s.Triggers.wake = s.Jobs.Notify
+	if cfg.Flights.DuffelToken != "" {
+		api := &duffel.Client{HTTP: &http.Client{Timeout: 60 * time.Second}, BaseURL: cfg.Flights.DuffelURL, Token: cfg.Flights.DuffelToken}
+		var sc *stripe.Client
+		payments := "off"
+		switch cfg.Flights.PaymentsMode {
+		case "pay":
+			if cfg.Flights.StripeKey != "" {
+				sc = &stripe.Client{HTTP: &http.Client{Timeout: 30 * time.Second}, BaseURL: cfg.Flights.StripeURL, Key: cfg.Flights.StripeKey}
+				payments = "pay"
+			}
+		case "balance":
+			payments = "balance"
+		}
+		s.Flights = NewFlightService(pool, api, box, s.Tasks, sc, cfg.PublicURL, payments, cfg.Flights.MaxAmountMinor)
+		s.Harness.Flights = s.Flights
+	}
 	s.Auth = NewAuthService(pool, cfg.Auth, NewGoogleVerifier(GoogleCertsURL, cfg.Auth.GoogleClientIDs))
 	return s
 }

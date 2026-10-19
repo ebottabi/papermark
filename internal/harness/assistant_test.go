@@ -253,8 +253,18 @@ func TestRoutineCreateNeedsApprovalThenCreates(t *testing.T) {
 }
 
 func TestRoutineRunsAreStrictAndToldToPublishOnce(t *testing.T) {
-	g := routineGuidance(&models.Preferences{Timezone: "Asia/Tokyo", NewsTopics: []string{"chess", "space"}}, time.Date(2026, 6, 10, 20, 0, 0, 0, time.UTC))
-	for _, want := range []string{"exactly one publish_update", "Asia/Tokyo", "Thursday 11 June 2026", "chess, space"} {
+	prefs := &models.Preferences{Timezone: "Asia/Tokyo", NewsTopics: []string{"chess", "space"}}
+	now := time.Date(2026, 6, 10, 20, 0, 0, 0, time.UTC)
+	g := routineGuidance(prefs, now, nil)
+	for _, want := range []string{"exactly one publish_update", "Asia/Tokyo", "Thursday 11 June 2026", "chess, space", "importance quiet", "first run"} {
+		if !strings.Contains(g, want) {
+			t.Errorf("guidance lacks %q: %s", want, g)
+		}
+	}
+	last := &models.Update{Title: "Flight €212", Body: "Down €18.", CreatedAt: now.Add(-6 * time.Hour),
+		Sections: []models.Section{{Title: "Fares", Items: []models.SectionItem{{Text: "TP1234", Detail: "€212"}}}}}
+	g = routineGuidance(prefs, now, last)
+	for _, want := range []string{"previous run's result (Wed 10 Jun 23:00", "Flight €212\nDown €18.", "Fares:\n  - TP1234 (€212)\n>>>"} {
 		if !strings.Contains(g, want) {
 			t.Errorf("guidance lacks %q: %s", want, g)
 		}
@@ -370,7 +380,7 @@ func TestFirstTurnPreparesOnlyThePrompt(t *testing.T) {
 		t.Fatalf("messages = %s", messages)
 	}
 	events, _ := queries.ListTaskEvents(ctx, f.pool, tn.id, -1)
-	if len(events) != 1 || !strings.Contains(string(events[0].Data), "Using skills: a, b") {
+	if len(events) != 1 || !strings.Contains(string(events[0].Data), `{"type":"skills","skills":[{"name":"a","title":"A","description":""},{"name":"b","title":"B","description":""}]}`) {
 		t.Fatalf("events = %v", events)
 	}
 }

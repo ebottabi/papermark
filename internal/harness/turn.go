@@ -82,7 +82,11 @@ func (h *Harness) runTurn(ctx context.Context, task *models.Task) error {
 	tn := &turn{h: h, id: task.ID, userID: task.UserID, scheduleID: task.ScheduleID, mode: task.Mode, conn: conn,
 		system: systemPrompt, loc: tools.Location(prefs.Timezone), maxSteps: h.maxSteps}
 	if task.ScheduleID != nil {
-		tn.system += routineGuidance(prefs, time.Now())
+		last, err := queries.LastScheduleUpdate(ctx, h.pool, *task.ScheduleID)
+		if err != nil && !errors.Is(err, queries.ErrNotFound) {
+			return err
+		}
+		tn.system += routineGuidance(prefs, time.Now(), last)
 		tn.maxSteps = min(h.maxSteps, h.routineMaxSteps)
 	}
 	if err := tn.offer(ctx, workspace); err != nil {
@@ -107,7 +111,7 @@ func (tn *turn) offer(ctx context.Context, workspace string) error {
 		return err
 	}
 	tn.env = &tools.Env{Skills: list, Workspace: workspace, TaskID: tn.id, UserID: tn.userID, ScheduleID: tn.scheduleID,
-		DB: tn.h.pool, Web: tn.h.web, Routines: tn.h.Routines,
+		DB: tn.h.pool, Web: tn.h.web, Routines: tn.h.Routines, Flights: tn.h.Flights, Media: tn.h.Media,
 		Notify: func(ctx context.Context, text string) error {
 			return tn.h.TaskTx(ctx, tn.id, func(_ pgx.Tx, _ *models.Task, emit Emit) error {
 				return emit(TextEvent{"notify", text})
@@ -325,7 +329,11 @@ func (tn *turn) deliverFirst(ctx context.Context) error {
 		if len(picked) == 0 {
 			return nil
 		}
-		return emit(TextEvent{"notify", "Using skills: " + strings.Join(picked, ", ")})
+		var list []skills.Skill
+		if tn.env != nil {
+			list = tn.env.Skills
+		}
+		return emit(tools.SkillsInUse(list, picked))
 	})
 }
 
