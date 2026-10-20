@@ -13,13 +13,6 @@ Purpose
 
 Turn an authorized target or a CTF challenge into a ranked, evidenced attack surface and a path to the objective (foothold, privilege, or flag). Enumerate thoroughly, prioritise by likely impact, and keep a trail that reproduces each step.
 
-Inputs / Prerequisites
-----------------------
-
-* Authorization and scope for a real engagement, or the challenge brief and rules for a CTF.
-* Target identifiers: hosts, ranges, URLs, or the provided challenge files.
-* Rules of engagement: rate limits, allowed techniques, out-of-scope hosts. Assume no destructive or denial testing unless stated.
-* A place to keep notes and the final write-up.
 
 Core Workflow
 -------------

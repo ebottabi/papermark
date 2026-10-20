@@ -13,13 +13,7 @@ Purpose
 
 Get from a challenge to its flag: find the single intended bug or insight, prove it, and extract the flag. Read first, enumerate fully, then commit to the most likely path for the category and point value. A CTF challenge almost always has one deliberate vulnerability; find that, do not boil the ocean.
 
-Inputs / Prerequisites
-----------------------
 
-* The challenge brief, category, point value, and any hint. Point value signals difficulty; the category and provided files signal technique.
-* Provided artifacts: source, a binary, a capture, an image, a URL, a `nc host port` service.
-* The flag format.
-* A scratch place for notes and the write-up.
 
 First moves (every challenge)
 -----------------------------
