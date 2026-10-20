@@ -10,6 +10,9 @@ package skills
 import (
 	"context"
 	"errors"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -17,8 +20,82 @@ import (
 	"papermark/internal/models/queries"
 )
 
+// traderScripts names the main script each trader skill tells the agent to run.
+var traderScripts = map[string]string{
+	"trader-alerts":    "alerts.py",
+	"trader-analyst":   "facts.py",
+	"trader-broker":    "ticket.py",
+	"trader-budget":    "size.py",
+	"trader-copycat":   "edgar13f.py",
+	"trader-news":      "news.py",
+	"trader-pelosi":    "ptr.py",
+	"trader-rebalance": "rebalance.py",
+	"trader-risk":      "check.py",
+	"trader-screener":  "screen.py",
+	"trader-tax":       "lots.py",
+}
+
+func TestTraderSkillsLoadWithExtractedScripts(t *testing.T) {
+	seen := map[string]bool{}
+	for _, s := range Builtin() {
+		if strings.Contains(s.Instructions, "${CLAUDE_SKILL_DIR}") || strings.Contains(s.Instructions, "${SKILLS_DIR}") {
+			t.Errorf("skill %q still has an unresolved placeholder", s.Name)
+		}
+		if !strings.HasPrefix(s.Name, "trader-") {
+			continue
+		}
+		seen[s.Name] = true
+		if !validName.MatchString(s.Name) || s.Description == "" || s.Instructions == "" {
+			t.Errorf("trader skill %q: name/description/instructions not all valid and non-empty", s.Name)
+		}
+		if strings.Contains(s.Description, "\n") {
+			t.Errorf("trader skill %q description is not one line", s.Name)
+		}
+		dir := filepath.Join(skillsBase, s.Name)
+		if !strings.Contains(s.Instructions, dir) {
+			t.Errorf("trader skill %q instructions do not reference its extracted dir %q", s.Name, dir)
+		}
+		script, ok := traderScripts[s.Name]
+		if !ok {
+			t.Errorf("no known script for trader skill %q", s.Name)
+			continue
+		}
+		path := filepath.Join(dir, script)
+		if _, err := os.Stat(path); err != nil {
+			t.Errorf("extracted script missing for %q: %v", s.Name, err)
+		}
+	}
+	for name := range traderScripts {
+		if !seen[name] {
+			t.Errorf("trader skill %q missing from Builtin()", name)
+		}
+	}
+}
+
+// TestTraderScriptRuns proves an extracted script is really runnable, not just
+// present: python3 check.py --help must exit cleanly (0, or argparse's usage 2).
+func TestTraderScriptRuns(t *testing.T) {
+	script := filepath.Join(skillsBase, "trader-risk", "check.py")
+	if _, err := os.Stat(script); err != nil {
+		t.Fatalf("extracted script missing: %v", err)
+	}
+	py, err := exec.LookPath("python3")
+	if err != nil {
+		t.Skip("python3 not on PATH")
+	}
+	out, err := exec.Command(py, script, "--help").CombinedOutput()
+	if err != nil {
+		if ee, ok := err.(*exec.ExitError); !ok || ee.ExitCode() != 2 {
+			t.Fatalf("check.py --help failed (not an argparse usage exit): %v\n%s", err, out)
+		}
+	}
+	if !strings.Contains(string(out), "usage") {
+		t.Fatalf("check.py --help produced no usage text:\n%s", out)
+	}
+}
+
 func TestBuiltinSkillsLoad(t *testing.T) {
-	want := []string{"bills-and-renewals", "book-flight", "ctf", "daily-briefing", "expenses", "follow-ups", "inbox-triage", "meeting-follow-up", "meeting-prep", "research-report", "s3-pentest-commands", "schedule-meeting", "security-recon", "travel-itinerary", "web-app-pentest", "weekly-review", "write-in-my-voice"}
+	want := []string{"bills-and-renewals", "book-flight", "ctf", "daily-briefing", "expenses", "follow-ups", "inbox-triage", "meeting-follow-up", "meeting-prep", "research-report", "s3-pentest-commands", "schedule-meeting", "security-recon", "trader-alerts", "trader-analyst", "trader-broker", "trader-budget", "trader-copycat", "trader-news", "trader-pelosi", "trader-rebalance", "trader-risk", "trader-screener", "trader-tax", "travel-itinerary", "web-app-pentest", "weekly-review", "write-in-my-voice"}
 	got := Builtin()
 	if len(got) != len(want) {
 		t.Fatalf("got %d skills, want %d", len(got), len(want))

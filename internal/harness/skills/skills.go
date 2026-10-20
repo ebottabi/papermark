@@ -13,7 +13,10 @@ import (
 	"context"
 	"embed"
 	"fmt"
+	"io/fs"
+	"os"
 	"path"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
@@ -31,10 +34,16 @@ type Skill struct {
 }
 
 //go:embed *.md
+//go:embed trader
 var files embed.FS
 
 // validName is the rule user skills follow too (API.md).
 var validName = regexp.MustCompile(`^[a-z0-9-]{1,40}$`)
+
+// skillsBase is where a skill's embedded scripts land on disk so the agent's
+// shell can run them; ${SKILLS_DIR} in a skill resolves to its own subfolder
+// here. Re-extracted on every start (a server restart gets a private tmp).
+var skillsBase = filepath.Join(os.TempDir(), "keen-skills")
 
 var builtin = mustLoad()
 
@@ -70,14 +79,20 @@ func For(ctx context.Context, db queries.DBTX, userID uuid.UUID) ([]Skill, error
 	return out, nil
 }
 
-// mustLoad parses every <name>.md: a "---" block with a description line, then the instructions.
+// mustLoad parses every <name>.md: a "---" block with a description line, then
+// the instructions. It also extracts the embedded trader/ scripts to disk and
+// resolves each skill's ${SKILLS_DIR} to its own extracted folder.
 func mustLoad() []Skill {
+	extractScripts()
 	entries, err := files.ReadDir(".")
 	if err != nil {
 		panic(err)
 	}
 	var out []Skill
 	for _, e := range entries {
+		if e.IsDir() { // the embedded trader/ tree, not a skill file
+			continue
+		}
 		raw, err := files.ReadFile(e.Name())
 		if err != nil {
 			panic(err)
@@ -86,9 +101,33 @@ func mustLoad() []Skill {
 		if err != nil {
 			panic(fmt.Sprintf("skill %s: %v", e.Name(), err))
 		}
+		s.Instructions = strings.ReplaceAll(s.Instructions, "${SKILLS_DIR}", filepath.Join(skillsBase, s.Name))
 		out = append(out, s)
 	}
 	return out // ReadDir sorts by file name
+}
+
+// extractScripts writes the embedded trader/ tree under skillsBase, preserving
+// subpaths, so trader/<name>/script.py lands at <skillsBase>/<name>/script.py.
+// A missing or unwritable script is a build-time bug, so it panics like the rest.
+func extractScripts() {
+	err := fs.WalkDir(files, "trader", func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		dst := filepath.Join(skillsBase, filepath.FromSlash(strings.TrimPrefix(p, "trader/")))
+		if d.IsDir() {
+			return os.MkdirAll(dst, 0o755)
+		}
+		data, err := files.ReadFile(p)
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(dst, data, 0o644)
+	})
+	if err != nil {
+		panic(err)
+	}
 }
 
 func parse(name, raw string) (Skill, error) {
