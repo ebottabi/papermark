@@ -20,7 +20,7 @@ import (
 // ErrConflict is returned when a unique constraint rejects a write.
 var ErrConflict = errors.New("record already exists")
 
-const connectorColumns = `id, user_id, name, kind, url, status, error, tools, account, history_id, created_at, updated_at`
+const connectorColumns = `id, user_id, name, kind, url, status, error, tools, account, history_id, created_at, updated_at, tools_spec`
 
 const (
 	insertConnector = `
@@ -33,7 +33,7 @@ const (
 
 	listConnectors = `SELECT ` + connectorColumns + ` FROM connectors WHERE user_id = $1 AND deleted_at IS NULL ORDER BY name ASC`
 
-	updateConnectorStatus = `UPDATE connectors SET status = $2, error = $3, tools = $4, updated_at = $5 WHERE id = $1`
+	updateConnectorStatus = `UPDATE connectors SET status = $2, error = $3, tools = $4, updated_at = $5, tools_spec = $6 WHERE id = $1`
 
 	updateConnectorAccount = `UPDATE connectors SET account = $2, history_id = $3, updated_at = $4 WHERE id = $1`
 
@@ -44,7 +44,7 @@ const (
 
 func scanConnector(row scannable) (*models.Connector, error) {
 	c := &models.Connector{}
-	if err := row.Scan(&c.ID, &c.UserID, &c.Name, &c.Kind, &c.URL, &c.Status, &c.Error, &c.Tools, &c.Account, &c.HistoryID, &c.CreatedAt, &c.UpdatedAt); err != nil {
+	if err := row.Scan(&c.ID, &c.UserID, &c.Name, &c.Kind, &c.URL, &c.Status, &c.Error, &c.Tools, &c.Account, &c.HistoryID, &c.CreatedAt, &c.UpdatedAt, &c.ToolsSpec); err != nil {
 		return nil, notFound(err)
 	}
 	return c, nil
@@ -98,7 +98,7 @@ func ListConnectors(ctx context.Context, db DBTX, userID uuid.UUID) ([]*models.C
 // UpdateConnectorStatus records the outcome of a connection attempt on c.
 func UpdateConnectorStatus(ctx context.Context, db DBTX, c *models.Connector) error {
 	c.UpdatedAt = time.Now().UTC()
-	_, err := db.Exec(ctx, updateConnectorStatus, c.ID, c.Status, c.Error, c.Tools, c.UpdatedAt)
+	_, err := db.Exec(ctx, updateConnectorStatus, c.ID, c.Status, c.Error, c.Tools, c.UpdatedAt, c.ToolsSpec)
 	return err
 }
 

@@ -467,43 +467,88 @@ func (s *ConnectorService) Snapshot(ctx context.Context, userID uuid.UUID) (*har
 		switch c.Kind {
 		case models.ConnectorGmail:
 			s.addGmail(ctx, set, c)
-			continue
 		case models.ConnectorCalendar:
 			s.addCalendar(ctx, set, c)
-			continue
 		case models.ConnectorContacts:
 			s.addContacts(ctx, set, c)
-			continue
 		case models.ConnectorDrive:
 			s.addDrive(ctx, set, c)
-			continue
-		}
-		sess, tools, err := s.connect(ctx, c)
-		if err != nil {
-			continue
-		}
-		sessions = append(sessions, sess)
-		for _, t := range tools {
-			name := mcp.ToolName(c.Name, t.Name)
-			if _, dup := set.Handlers[name]; dup {
-				continue
-			}
-			set.Tools = append(set.Tools, harness.ConnectorTool{Name: name, Description: "[" + c.Name + "] " + t.Description, InputSchema: t.InputSchema})
-			toolName, c := t.Name, c
-			set.Handlers[name] = func(ctx context.Context, input json.RawMessage) (string, bool, error) {
-				text, isErr, err := sess.Call(ctx, toolName, input)
-				if errors.Is(err, mcp.ErrNeedsAuth) {
-					return s.needsReconnect(c), true, nil
-				}
-				return text, isErr, err
-			}
-			if !t.ReadOnly {
-				set.NeedsApproval[name] = true
-			}
+		default:
+			s.addMCP(ctx, set, c, &sessions)
 		}
 	}
 	sort.Slice(set.Tools, func(i, j int) bool { return set.Tools[i].Name < set.Tools[j].Name })
 	return set, nil
+}
+
+// addMCP offers an MCP connector's tools. When the connector is connected and
+// its tool list is cached, the tools are offered from the cache and the live
+// session is dialed only on first use (opened sessions are appended to sessions
+// for the caller to close); otherwise it dials now, as it always did, which
+// also warms the cache for next time.
+// shortcut: the cache refreshes on reconnect, on the Connectors page, and on a
+// task's first call into the connector; a tool added server-side is offered on
+// the next task that dials. Persist tool changes eagerly if that lag matters.
+func (s *ConnectorService) addMCP(ctx context.Context, set *harness.ConnectorToolset, c *models.Connector, sessions *[]*mcp.Session) {
+	var cached []mcp.Tool
+	if c.Status == models.ConnectorConnected && len(c.ToolsSpec) > 0 {
+		if err := json.Unmarshal(c.ToolsSpec, &cached); err != nil {
+			cached = nil
+		}
+	}
+	if cached == nil {
+		sess, tools, err := s.connect(ctx, c)
+		if err != nil {
+			return
+		}
+		*sessions = append(*sessions, sess)
+		s.offerMCP(set, c, tools, func(context.Context) (*mcp.Session, error) { return sess, nil })
+		return
+	}
+	var (
+		once sync.Once
+		sess *mcp.Session
+		derr error
+	)
+	dial := func(ctx context.Context) (*mcp.Session, error) {
+		once.Do(func() {
+			if sess, _, derr = s.connect(ctx, c); derr == nil {
+				*sessions = append(*sessions, sess)
+			}
+		})
+		return sess, derr
+	}
+	s.offerMCP(set, c, cached, dial)
+}
+
+// offerMCP registers tools on set, each call routed through getSession so the
+// live connection can be opened lazily. Duplicate tool names are skipped.
+func (s *ConnectorService) offerMCP(set *harness.ConnectorToolset, c *models.Connector, tools []mcp.Tool, getSession func(context.Context) (*mcp.Session, error)) {
+	for _, t := range tools {
+		name := mcp.ToolName(c.Name, t.Name)
+		if _, dup := set.Handlers[name]; dup {
+			continue
+		}
+		set.Tools = append(set.Tools, harness.ConnectorTool{Name: name, Description: "[" + c.Name + "] " + t.Description, InputSchema: t.InputSchema})
+		toolName, c := t.Name, c
+		set.Handlers[name] = func(ctx context.Context, input json.RawMessage) (string, bool, error) {
+			sess, err := getSession(ctx)
+			if err != nil {
+				if errors.Is(err, mcp.ErrNeedsAuth) {
+					return s.needsReconnect(c), true, nil
+				}
+				return "", true, err
+			}
+			text, isErr, err := sess.Call(ctx, toolName, input)
+			if errors.Is(err, mcp.ErrNeedsAuth) {
+				return s.needsReconnect(c), true, nil
+			}
+			return text, isErr, err
+		}
+		if !t.ReadOnly {
+			set.NeedsApproval[name] = true
+		}
+	}
 }
 
 // addGmail adds one set of Gmail tools over c's connected accounts. An
@@ -952,6 +997,9 @@ func (s *ConnectorService) markNeedsAuth(c *models.Connector) {
 func (s *ConnectorService) connect(ctx context.Context, c *models.Connector) (*mcp.Session, []mcp.Tool, error) {
 	sess, tools, err := s.dial(ctx, c)
 	c.Status, c.Error, c.Tools = models.ConnectorConnected, nil, len(tools)
+	if err == nil {
+		c.ToolsSpec, _ = json.Marshal(tools) // cache for cache-only task starts; keep the old cache on a failed dial
+	}
 	switch {
 	case errors.Is(err, mcp.ErrNeedsAuth):
 		c.Status = models.ConnectorNeedsAuth

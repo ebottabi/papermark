@@ -53,6 +53,7 @@ type Connector struct {
 	Status    string    `gorm:"type:varchar(16);not null" json:"status"`
 	Error     *string   `gorm:"type:text" json:"error"`
 	Tools     int       `gorm:"not null;default:0" json:"tools"`
+	ToolsSpec []byte    `gorm:"type:jsonb" json:"-"` // cached MCP tool specs, so a task start need not dial
 	Account   *string   `gorm:"type:text" json:"account"`
 	HistoryID string    `gorm:"type:varchar(32);not null;default:''" json:"-"`
 
