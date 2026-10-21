@@ -82,11 +82,11 @@ func LockTask(ctx context.Context, db DBTX, id uuid.UUID) (*models.Task, error) 
 	return scanTask(db.QueryRow(ctx, `SELECT `+taskColumns+` FROM tasks WHERE id = $1 FOR UPDATE`, id))
 }
 
-// ListTasks returns userID's tasks newest updated_at first, filtered by
-// archived and (when projectID is non-nil) project.
+// ListTasks returns userID's top-level tasks (not sub-agent children) newest
+// updated_at first, filtered by archived and (when projectID is non-nil) project.
 func ListTasks(ctx context.Context, db DBTX, userID uuid.UUID, archived bool, projectID *uuid.UUID) ([]*models.Task, error) {
 	return scanTasks(db, ctx, `SELECT `+taskColumns+` FROM tasks
-		WHERE user_id = $3 AND archived = $1 AND ($2::uuid IS NULL OR project_id = $2)
+		WHERE user_id = $3 AND parent_id IS NULL AND archived = $1 AND ($2::uuid IS NULL OR project_id = $2)
 		ORDER BY updated_at DESC, id`, archived, projectID, userID)
 }
 
