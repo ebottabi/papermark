@@ -93,15 +93,45 @@ func callsOf(message json.RawMessage) []toolCall {
 	calls := make([]toolCall, len(m.ToolCalls))
 	for i, tc := range m.ToolCalls {
 		calls[i] = toolCall{ID: tc.ID, Name: tc.Function.Name}
-		args := strings.TrimSpace(tc.Function.Arguments)
-		if args == "" {
-			args = "{}"
-		}
-		if strings.HasPrefix(args, "{") && json.Valid([]byte(args)) {
-			calls[i].Input = json.RawMessage(args)
+		if in, ok := objectArgs(tc.Function.Arguments); ok {
+			calls[i].Input = in
 		}
 	}
 	return calls
+}
+
+// objectArgs normalises a tool call's arguments and reports whether they are a
+// JSON object, treating empty as "{}". A length-truncated turn leaves a
+// half-written call that fails this: callsOf then leaves its Input nil (it
+// cannot run) and replayable drops it (it cannot be resent), so the two paths
+// agree on exactly which calls are usable.
+func objectArgs(arguments string) (json.RawMessage, bool) {
+	args := strings.TrimSpace(arguments)
+	if args == "" {
+		args = "{}"
+	}
+	if strings.HasPrefix(args, "{") && json.Valid([]byte(args)) {
+		return json.RawMessage(args), true
+	}
+	return nil, false
+}
+
+// replayable returns the assistant message pruned to what is safe to store and
+// resend to the model: tool calls with non-object arguments are dropped, and
+// reasoning_content is cleared. The provider rejects a replayed turn that
+// carries a truncated tool call, and the reasoning is output-only, never read
+// back, and large enough to dominate the request. m is a value, so the caller's
+// response is left intact.
+func replayable(m fireworks.Message) fireworks.Message {
+	m.ReasoningContent = ""
+	kept := make([]fireworks.ToolCall, 0, len(m.ToolCalls))
+	for _, tc := range m.ToolCalls {
+		if _, ok := objectArgs(tc.Function.Arguments); ok {
+			kept = append(kept, tc)
+		}
+	}
+	m.ToolCalls = kept
+	return m
 }
 
 // eventInput is a call's input as an event shows it.

@@ -170,7 +170,7 @@ func (tn *turn) run(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		assistant, err := json.Marshal(res.Message)
+		assistant, err := json.Marshal(replayable(res.Message))
 		if err != nil {
 			return err
 		}
@@ -245,7 +245,7 @@ func (tn *turn) wrapUp(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	assistant, err := json.Marshal(res.Message)
+	assistant, err := json.Marshal(replayable(res.Message))
 	if err != nil {
 		return err
 	}
