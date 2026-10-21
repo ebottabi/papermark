@@ -23,6 +23,7 @@ import (
 	"papermark/internal/cache"
 	"papermark/internal/harness"
 	"papermark/internal/harness/skills"
+	"papermark/internal/harness/tools"
 	"papermark/internal/models"
 	"papermark/internal/models/queries"
 	"papermark/internal/storage"
@@ -112,6 +113,45 @@ func (s *TaskService) create(ctx context.Context, db harness.Beginner, in NewTas
 		return uuid.Nil, err
 	}
 	return t.ID, nil
+}
+
+// Spawn creates one sub-agent child task per spec under parent, each with its
+// own first message and run job, all in tx so they commit with the parent's
+// turn. It returns the children in spec order for the parent to park on. The
+// harness calls it through harness.Spawner.
+func (s *TaskService) Spawn(ctx context.Context, tx pgx.Tx, parent uuid.UUID, specs []tools.AgentSpec) ([]models.ChildAgent, error) {
+	p, err := queries.GetTask(ctx, tx, parent)
+	if err != nil {
+		return nil, err
+	}
+	children := make([]models.ChildAgent, len(specs))
+	for i, spec := range specs {
+		mode := spec.Mode
+		if mode != "speed" && mode != "quality" {
+			mode = p.Mode
+		}
+		child := &models.Task{Base: models.Base{ID: uuid.New()}, UserID: p.UserID, Prompt: spec.Prompt, Status: models.TaskRunning, Mode: mode, ParentID: &parent}
+		if err := queries.InsertTask(ctx, tx, child); err != nil {
+			return nil, err
+		}
+		// The child's own event log gets the prompt so its lane shows it; this
+		// writes no bus event, so nothing is published before the parent commits.
+		msg, err := json.Marshal(harness.MessageEvent{Type: "message", Text: spec.Prompt})
+		if err != nil {
+			return nil, err
+		}
+		if _, err := queries.AppendTaskEvent(ctx, tx, child.ID, models.TaskRunning, "message", msg); err != nil {
+			return nil, err
+		}
+		if err := queries.InsertTaskInbox(ctx, tx, child.ID, spec.Prompt); err != nil {
+			return nil, err
+		}
+		if err := s.s.Jobs.Enqueue(ctx, tx, harness.TurnJob, child.ID.String(), harness.TurnPayload{TaskID: child.ID}); err != nil {
+			return nil, err
+		}
+		children[i] = models.ChildAgent{TaskID: child.ID, Title: spec.Title}
+	}
+	return children, nil
 }
 
 // start records a user message and enqueues a run that delivers it. text is

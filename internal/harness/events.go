@@ -9,6 +9,7 @@ package harness
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -57,6 +58,17 @@ type (
 		Type  string   `json:"type"`
 		Text  string   `json:"text"`
 		Files []string `json:"files"`
+	}
+	AgentStartedEvent struct { // a sub-agent began
+		Type    string `json:"type"`
+		AgentID string `json:"agentId"`
+		Title   string `json:"title"`
+	}
+	AgentDoneEvent struct { // a sub-agent finished
+		Type    string `json:"type"`
+		AgentID string `json:"agentId"`
+		Text    string `json:"text"`
+		IsError bool   `json:"isError"`
 	}
 )
 
@@ -135,7 +147,10 @@ func (h *Harness) tx(ctx context.Context, db Beginner, taskID uuid.UUID, load fu
 		if err := fn(tx, task, emit); err != nil {
 			return err
 		}
-		return settleRoutine(ctx, tx, task, out)
+		if err := settleRoutine(ctx, tx, task, out); err != nil {
+			return err
+		}
+		return settleParent(ctx, tx, task, out)
 	})
 	if err != nil {
 		return err
@@ -185,6 +200,57 @@ func settleRoutine(ctx context.Context, tx pgx.Tx, task *models.Task, out []emit
 		}
 	}
 	return nil
+}
+
+// settleParent records a finished sub-agent's outcome into its parent and
+// wakes the parent. It runs in the child's terminal transaction: the child row
+// is already locked, so locking the parent here fixes a child-then-parent order
+// that cannot deadlock (no path locks parent-then-child). The write is set-once
+// per child, so a retried terminal turn is a no-op, and enqueuing the parent is
+// idempotent (the job dedup folds concurrent siblings).
+func settleParent(ctx context.Context, tx pgx.Tx, task *models.Task, out []emitted) error {
+	if task.ParentID == nil {
+		return nil
+	}
+	var done *emitted
+	for i, em := range out {
+		if em.head.Type == "idle" || em.head.Type == "error" || em.head.Type == "stopped" {
+			done = &out[i]
+		}
+	}
+	if done == nil {
+		return nil
+	}
+	parent, err := queries.LockTask(ctx, tx, *task.ParentID)
+	if err != nil {
+		if errors.Is(err, queries.ErrNotFound) {
+			return nil
+		}
+		return err
+	}
+	if parent.Pending == nil || parent.Pending.Kind != "agents" {
+		return nil // parent is no longer waiting on its sub-agents
+	}
+	hit := false
+	for i := range parent.Pending.Children {
+		ch := &parent.Pending.Children[i]
+		if ch.TaskID != task.ID || ch.Done {
+			continue
+		}
+		ch.Done, ch.Text, ch.IsError = true, done.head.Text, done.head.Type != "idle"
+		hit = true
+	}
+	if !hit {
+		return nil
+	}
+	if err := queries.SetTaskRunState(ctx, tx, parent.ID, parent.Pending, parent.PartialResults); err != nil {
+		return err
+	}
+	payload, err := json.Marshal(TurnPayload{TaskID: parent.ID})
+	if err != nil {
+		return err
+	}
+	return queries.EnqueueJob(ctx, tx, &models.Job{Type: TurnJob, Key: parent.ID.String(), Payload: payload})
 }
 
 // confirmVerbs says what an approval is for in a push, which has no room for the card.

@@ -16,13 +16,13 @@ import (
 	"github.com/google/uuid"
 )
 
-const taskColumns = `id, user_id, created_at, updated_at, prompt, status, mode, project_id, schedule_id, favorite, archived,
+const taskColumns = `id, user_id, created_at, updated_at, prompt, status, mode, project_id, schedule_id, parent_id, favorite, archived,
 	input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, event_count,
 	pending, partial_results, always_allowed, stop_requested`
 
 func scanTask(row scannable) (*models.Task, error) {
 	var t models.Task
-	err := row.Scan(&t.ID, &t.UserID, &t.CreatedAt, &t.UpdatedAt, &t.Prompt, &t.Status, &t.Mode, &t.ProjectID, &t.ScheduleID,
+	err := row.Scan(&t.ID, &t.UserID, &t.CreatedAt, &t.UpdatedAt, &t.Prompt, &t.Status, &t.Mode, &t.ProjectID, &t.ScheduleID, &t.ParentID,
 		&t.Favorite, &t.Archived, &t.InputTokens, &t.OutputTokens, &t.CacheReadTokens, &t.CacheWriteTokens,
 		&t.EventCount, &t.Pending, &t.PartialResults, &t.AlwaysAllowed, &t.StopRequested)
 	if err != nil {
@@ -54,10 +54,10 @@ func InsertTask(ctx context.Context, db DBTX, t *models.Task) error {
 		t.ID = uuid.New()
 	}
 	row := db.QueryRow(ctx, `
-		INSERT INTO tasks (id, user_id, created_at, updated_at, prompt, status, mode, project_id, schedule_id)
-		VALUES ($1, $7, now(), now(), $2, $3, $4, $5, $6)
+		INSERT INTO tasks (id, user_id, created_at, updated_at, prompt, status, mode, project_id, schedule_id, parent_id)
+		VALUES ($1, $7, now(), now(), $2, $3, $4, $5, $6, $8)
 		RETURNING `+taskColumns,
-		t.ID, t.Prompt, t.Status, t.Mode, t.ProjectID, t.ScheduleID, t.UserID)
+		t.ID, t.Prompt, t.Status, t.Mode, t.ProjectID, t.ScheduleID, t.UserID, t.ParentID)
 	got, err := scanTask(row)
 	if err != nil {
 		return err

@@ -40,6 +40,13 @@ type TurnPayload struct {
 	TaskID uuid.UUID `json:"taskId"`
 }
 
+// Spawner creates sub-agent child tasks for a parent turn. It inserts the
+// children and enqueues their turns in the parent's transaction. Implemented
+// by the task service.
+type Spawner interface {
+	Spawn(ctx context.Context, tx pgx.Tx, parent uuid.UUID, specs []tools.AgentSpec) ([]models.ChildAgent, error)
+}
+
 // Harness runs chat turns as durable jobs. A turn is idempotent: it
 // rebuilds everything from Postgres, so a retried or re-enqueued job
 // continues where the last one stopped.
@@ -53,6 +60,7 @@ type Harness struct {
 	Flights    tools.Flights     // nil: no flight tools
 	Media      tools.MediaReader // nil: images, audio and video can't be read
 	Preparer   Preparer
+	Spawner    Spawner // nil: no agent tool (no sub-agents)
 
 	pool       *pgxpool.Pool
 	bus        cache.Bus

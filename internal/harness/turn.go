@@ -46,6 +46,7 @@ type turn struct {
 	id         uuid.UUID
 	userID     uuid.UUID
 	scheduleID *uuid.UUID // set when a routine started the task
+	parentID   *uuid.UUID // set when this task is a sub-agent
 	mode       string
 	system     string
 	loc        *time.Location // the user's time zone, for stamping their messages
@@ -66,20 +67,25 @@ func (h *Harness) runTurn(ctx context.Context, task *models.Task) error {
 	if err := os.MkdirAll(workspace, 0o755); err != nil {
 		return err
 	}
-	conn, err := h.Connectors.Snapshot(ctx, task.UserID)
-	if err != nil {
-		log.Printf("agent: task %s runs without connectors: %v", task.ID, err)
-		conn = &ConnectorToolset{}
-	}
-	if conn.Close != nil {
-		defer conn.Close()
+	// A sub-agent has no connectors: it cannot approve, so it is offered none.
+	subAgent := task.ParentID != nil
+	conn := &ConnectorToolset{}
+	if !subAgent {
+		var err error
+		if conn, err = h.Connectors.Snapshot(ctx, task.UserID); err != nil {
+			log.Printf("agent: task %s runs without connectors: %v", task.ID, err)
+			conn = &ConnectorToolset{}
+		}
+		if conn.Close != nil {
+			defer conn.Close()
+		}
 	}
 
 	prefs, err := queries.GetPreferences(ctx, h.pool, task.UserID)
 	if err != nil {
 		return err
 	}
-	tn := &turn{h: h, id: task.ID, userID: task.UserID, scheduleID: task.ScheduleID, mode: task.Mode, conn: conn,
+	tn := &turn{h: h, id: task.ID, userID: task.UserID, scheduleID: task.ScheduleID, parentID: task.ParentID, mode: task.Mode, conn: conn,
 		system: systemPrompt, loc: tools.Location(prefs.Timezone), maxSteps: h.maxSteps}
 	if task.ScheduleID != nil {
 		last, err := queries.LastScheduleUpdate(ctx, h.pool, *task.ScheduleID)
@@ -111,7 +117,7 @@ func (tn *turn) offer(ctx context.Context, workspace string) error {
 		return err
 	}
 	tn.env = &tools.Env{Skills: list, Workspace: workspace, TaskID: tn.id, UserID: tn.userID, ScheduleID: tn.scheduleID,
-		DB: tn.h.pool, Web: tn.h.web, Routines: tn.h.Routines, Flights: tn.h.Flights, Media: tn.h.Media,
+		DB: tn.h.pool, Web: tn.h.web, Routines: tn.h.Routines, Flights: tn.h.Flights, Media: tn.h.Media, CanSpawn: tn.h.Spawner != nil && tn.parentID == nil,
 		Notify: func(ctx context.Context, text string) error {
 			return tn.h.TaskTx(ctx, tn.id, func(_ pgx.Tx, _ *models.Task, emit Emit) error {
 				return emit(TextEvent{"notify", text})
@@ -122,7 +128,7 @@ func (tn *turn) offer(ctx context.Context, workspace string) error {
 		}}
 	tn.builtin = map[string]tools.Tool{}
 	tn.specs = nil
-	for _, t := range tools.Offered(tn.env, tn.scheduleID != nil) {
+	for _, t := range tools.Offered(tn.env, tn.scheduleID != nil, tn.parentID != nil) {
 		tn.builtin[t.Name] = t
 		tn.specs = append(tn.specs, tools.Function(t.Name, t.Description, t.Schema))
 	}
@@ -381,7 +387,17 @@ func (tn *turn) runTools(ctx context.Context, assistant json.RawMessage, resume 
 	}
 	i := len(task.PartialResults)
 	if resume && i < len(calls) {
-		if p := task.Pending; p != nil && p.Answer != nil && p.ToolUseID == calls[i].ID {
+		p := task.Pending
+		switch {
+		case p != nil && p.Kind == "agents" && p.ToolUseID == calls[i].ID:
+			if !allChildrenDone(p.Children) {
+				return true, nil // sub-agents still running; a child wakes us when it ends
+			}
+			if err := tn.recordAgents(ctx, calls[i], p.Children); err != nil {
+				return false, err
+			}
+			i++
+		case p != nil && p.Answer != nil && p.ToolUseID == calls[i].ID:
 			// Consume the approval before the call starts, so a worker that dies
 			// mid-call leaves it interrupted instead of running it twice.
 			if err := queries.SetTaskRunState(ctx, tn.h.pool, tn.id, nil, task.PartialResults); err != nil {
@@ -395,7 +411,7 @@ func (tn *turn) runTools(ctx context.Context, assistant json.RawMessage, resume 
 				return false, err
 			}
 			i++
-		} else {
+		default:
 			for ; i < len(calls); i++ {
 				if err := tn.record(ctx, calls[i], tools.Output{Text: interruptedText, IsError: true}, nil); err != nil {
 					return false, err
@@ -426,6 +442,19 @@ func (tn *turn) runTools(ctx context.Context, assistant json.RawMessage, resume 
 			if err := tn.record(ctx, c, tools.Output{Text: "ok"}, nil); err != nil {
 				return false, err
 			}
+		case c.Name == "agent":
+			specs, perr := tools.ParseAgents(c.Input)
+			if perr != nil || len(specs) == 0 {
+				out := tools.Output{Text: "Error: agents must be a non-empty list.", IsError: true}
+				if err := tn.record(ctx, c, out, ToolEvent{"tool", c.Name, c.eventInput(), out.Text, true}); err != nil {
+					return false, err
+				}
+				continue
+			}
+			if len(specs) > tools.MaxAgents {
+				specs = specs[:tools.MaxAgents]
+			}
+			return true, tn.parkAgents(ctx, c, specs)
 		case tn.needsApproval(c.Name) && !slices.Contains(task.AlwaysAllowed, c.Name):
 			return true, tn.park(ctx, c, ConfirmEvent{"confirm", c.Name, c.Input, !tn.conn.NoAlways[c.Name]})
 		default:
@@ -514,6 +543,69 @@ func (tn *turn) park(ctx context.Context, c toolCall, event any) error {
 		}
 		return queries.SetTaskRunState(ctx, tx, tn.id, &models.PendingAction{Kind: kind, Name: c.Name, ToolUseID: c.ID, NoAlways: tn.conn.NoAlways[c.Name], Input: c.Input}, t.PartialResults)
 	})
+}
+
+// parkAgents spawns the sub-agents of an agent call and parks the turn on
+// them. The task stays running but holds no job; each child's terminal turn
+// writes its outcome into the pending children and re-enqueues this task, and
+// the resume path assembles the combined result once all children are done.
+func (tn *turn) parkAgents(ctx context.Context, c toolCall, specs []tools.AgentSpec) error {
+	return tn.h.TaskTx(ctx, tn.id, func(tx pgx.Tx, t *models.Task, emit Emit) error {
+		children, err := tn.h.Spawner.Spawn(ctx, tx, tn.id, specs)
+		if err != nil {
+			return err
+		}
+		for _, ch := range children {
+			if err := emit(AgentStartedEvent{"agent_started", ch.TaskID.String(), ch.Title}); err != nil {
+				return err
+			}
+		}
+		return queries.SetTaskRunState(ctx, tx, tn.id, &models.PendingAction{Kind: "agents", Name: c.Name, ToolUseID: c.ID, Children: children}, t.PartialResults)
+	})
+}
+
+// recordAgents writes the agent call's combined result and emits one agent_done
+// per child in one transaction, clearing the pending agents. The committed
+// partial result advances the resume index past this call, so a retry never
+// re-emits the agent_done events.
+func (tn *turn) recordAgents(ctx context.Context, c toolCall, children []models.ChildAgent) error {
+	result, err := toolMessage(c.ID, combinedAgents(children))
+	if err != nil {
+		return err
+	}
+	return tn.h.TaskTx(ctx, tn.id, func(tx pgx.Tx, t *models.Task, emit Emit) error {
+		for _, ch := range children {
+			if err := emit(AgentDoneEvent{"agent_done", ch.TaskID.String(), ch.Text, ch.IsError}); err != nil {
+				return err
+			}
+		}
+		return queries.SetTaskRunState(ctx, tx, tn.id, nil, append(t.PartialResults, result))
+	})
+}
+
+func allChildrenDone(children []models.ChildAgent) bool {
+	for _, ch := range children {
+		if !ch.Done {
+			return false
+		}
+	}
+	return true
+}
+
+// combinedAgents renders every sub-agent's result as the agent call's output.
+func combinedAgents(children []models.ChildAgent) string {
+	var b strings.Builder
+	for i, ch := range children {
+		if i > 0 {
+			b.WriteString("\n\n")
+		}
+		b.WriteString("## " + ch.Title)
+		if ch.IsError {
+			b.WriteString(" (failed)")
+		}
+		b.WriteString("\n" + ch.Text)
+	}
+	return b.String()
 }
 
 // finish writes one tool message per call, then any queued messages as a

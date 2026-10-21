@@ -28,12 +28,14 @@ const (
 // before it in the same assistant turn.
 type Task struct {
 	Base
-	UserID           uuid.UUID         `gorm:"type:uuid;not null;index" json:"userId"`
-	Prompt           string            `gorm:"type:text;not null" json:"prompt"`
-	Status           string            `gorm:"type:varchar(16);not null;index" json:"status"`
-	Mode             string            `gorm:"type:varchar(16);not null" json:"mode"`
-	ProjectID        *uuid.UUID        `gorm:"type:uuid;index" json:"projectId"`
-	ScheduleID       *uuid.UUID        `gorm:"type:uuid;index" json:"scheduleId"`
+	UserID     uuid.UUID  `gorm:"type:uuid;not null;index" json:"userId"`
+	Prompt     string     `gorm:"type:text;not null" json:"prompt"`
+	Status     string     `gorm:"type:varchar(16);not null;index" json:"status"`
+	Mode       string     `gorm:"type:varchar(16);not null" json:"mode"`
+	ProjectID  *uuid.UUID `gorm:"type:uuid;index" json:"projectId"`
+	ScheduleID *uuid.UUID `gorm:"type:uuid;index" json:"scheduleId"`
+	ParentID   *uuid.UUID `gorm:"type:uuid;index" json:"parentId"` // set on a sub-agent; its parent task
+
 	Favorite         bool              `gorm:"not null;default:false" json:"favorite"`
 	Archived         bool              `gorm:"not null;default:false" json:"archived"`
 	InputTokens      int64             `gorm:"not null;default:0" json:"inputTokens"`
@@ -52,15 +54,28 @@ func (Task) TableName() string { return "tasks" }
 
 // PendingAction is the tool call a waiting task parked on. Answer is set by
 // /reply (the text) or /confirm (the decision) and consumed by the next run.
+// For kind "agents" the task is not waiting on the user but on its sub-agents:
+// Children holds them, and each child's own terminal turn fills in its outcome.
 type PendingAction struct {
-	Kind      string  `json:"kind"` // ask | confirm
+	Kind      string  `json:"kind"` // ask | confirm | agents
 	Name      string  `json:"name"`
 	ToolUseID string  `json:"toolUseId"`
 	Answer    *string `json:"answer,omitempty"`
 	NoAlways  bool    `json:"noAlways,omitempty"` // confirm only: "always" is refused
 	// Input is the resolved input the user saw on the confirm card; the
 	// approved call runs with it, not a fresh resolve (e.g. the Gmail primary changing).
-	Input json.RawMessage `json:"input,omitempty"`
+	Input    json.RawMessage `json:"input,omitempty"`
+	Children []ChildAgent    `json:"children,omitempty"` // agents only
+}
+
+// ChildAgent is one sub-agent a parent turn parked on. Done, Text and IsError
+// are written once, by the child's own terminal turn.
+type ChildAgent struct {
+	TaskID  uuid.UUID `json:"taskId"`
+	Title   string    `json:"title"`
+	Done    bool      `json:"done"`
+	Text    string    `json:"text"`
+	IsError bool      `json:"isError"`
 }
 
 // TaskEvent is one entry of a task's append-only event log. Data is the

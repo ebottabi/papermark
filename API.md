@@ -104,6 +104,8 @@ type AgentEvent =
   | { type: "stopped"; text: string }
   | { type: "error"; text: string }
   | { type: "update"; id: string; importance: Importance; title: string; body: string; sections: Section[] } // a published update; the task keeps running
+  | { type: "agent_started"; agentId: string; title: string }                    // a sub-agent began; agentId is its task id
+  | { type: "agent_done"; agentId: string; text: string; isError: boolean }       // that sub-agent finished; the task keeps running
 type Importance = "quiet" | "feed" | "push"
 type Section = { title: string; items: { text: string; detail?: string; url?: string }[] }
 type Update = {
@@ -116,6 +118,12 @@ type Decision = "allow" | "always" | "deny"
 ```
 
 The first event of every task is its `message` (the prompt). Clients must ignore event types they do not know.
+
+A task may spawn parallel sub-agents with the `agent` tool. It emits one `agent_started` per sub-agent, keeps
+running while they work, then emits one `agent_done` each once they all finish. Each `agentId` is the sub-agent's
+own task id: its live output is the ordinary `GET /tasks/:agentId/events` stream, so a client renders one lane per
+sub-agent by streaming that id. A sub-agent is offered a restricted toolset (no `shell_exec`, no connectors, no
+`ask`/`confirm`, no nested `agent`), so it never waits on the user; it ends at `idle` or `error`.
 
 `tool` names: built-ins `message_notify_user`, `file_read`, `file_write`, `shell_exec`, `web_search`, `web_fetch`,
 `publish_update`, `memory_save`, `memory_search`, `conversation_search`, `skill_read`, `routine_create`

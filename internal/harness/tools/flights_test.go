@@ -166,7 +166,7 @@ func TestFlightSearchValidatesInput(t *testing.T) {
 func TestFlightToolsAreOfferedOnlyWithFlights(t *testing.T) {
 	names := func(env *Env) string {
 		var n []string
-		for _, tool := range Offered(env, false) {
+		for _, tool := range Offered(env, false, false) {
 			n = append(n, tool.Name)
 		}
 		return strings.Join(n, ",")

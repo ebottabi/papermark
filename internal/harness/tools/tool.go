@@ -68,6 +68,7 @@ type Env struct {
 	Flights    Flights        // nil: no flight tools
 	Skills     []skills.Skill // what skill_read offers, sorted by name
 	Media      MediaReader    // nil: images, audio and video can't be read
+	CanSpawn   bool           // the harness can spawn sub-agents: offer the agent tool
 	// Notify adds a notify event to the task.
 	Notify func(ctx context.Context, text string) error
 	// TaskTx runs fn in the task's locked transaction; events emitted in fn
@@ -76,8 +77,21 @@ type Env struct {
 }
 
 // Offered returns the tools one run offers, in the order the model sees
-// them. The order is fixed so the prompt-cache prefix stays stable.
-func Offered(env *Env, routineRun bool) []Tool {
+// them. The order is fixed so the prompt-cache prefix stays stable. A
+// sub-agent (subAgent) gets a restricted set: no shell, no connectors, no
+// recursion, and nothing that parks on the user, since it has no way to reach them.
+func Offered(env *Env, routineRun, subAgent bool) []Tool {
+	if subAgent {
+		out := []Tool{NotifyUser, FileRead, FileWrite, WebFetch, Idle}
+		if env.Web.CanSearch() {
+			out = append(out, WebSearch)
+		}
+		out = append(out, MemorySave, MemorySearch, ConversationSearch)
+		if len(env.Skills) > 0 {
+			out = append(out, SkillRead(env.Skills))
+		}
+		return out
+	}
 	out := []Tool{NotifyUser, AskUser, FileRead, FileWrite, ShellExec, WebFetch, Idle}
 	if env.Web.CanSearch() {
 		out = append(out, WebSearch)
@@ -88,6 +102,9 @@ func Offered(env *Env, routineRun bool) []Tool {
 	}
 	if env.Routines != nil && !routineRun {
 		out = append(out, RoutineCreate)
+	}
+	if env.CanSpawn && !routineRun {
+		out = append(out, Agent)
 	}
 	if env.Flights != nil {
 		out = append(out, FlightSearch, FlightOffer, FlightCheckout, BookingGet)

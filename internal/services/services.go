@@ -89,6 +89,7 @@ func New(cfg *config.Config, pool *pgxpool.Pool, rdb *redis.Client) *Services {
 	s.Memories = NewMemoryService(pool)
 	s.Tasks = &TaskService{pool: pool, s: s}
 	s.Harness.Preparer = s.Tasks
+	s.Harness.Spawner = s.Tasks
 	s.Projects = &ProjectService{pool: pool}
 	s.Knowledge = &KnowledgeService{pool: pool}
 	s.Skills = &SkillService{pool: pool}
