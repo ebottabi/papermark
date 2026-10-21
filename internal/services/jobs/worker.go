@@ -10,7 +10,9 @@ package jobs
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -102,6 +104,18 @@ func (w *Worker) Run(ctx context.Context) error {
 func (w *Worker) run(parent context.Context, job *models.Job) {
 	ctx, cancel := context.WithCancelCause(parent)
 	defer cancel(nil)
+	// A panicking handler must fail its own job, not take down the worker.
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("job worker: panic type=%s id=%s: %v\n%s", job.Type, job.ID, r, debug.Stack())
+			bctx, bcancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer bcancel()
+			next := time.Now().UTC().Add(Backoff(job.Attempts))
+			if ferr := queries.FailJob(bctx, w.svc.pool, job.ID, w.workerID, next, fmt.Sprintf("panic: %v", r)); ferr != nil {
+				log.Printf("job worker: fail bookkeeping failed id=%s: %v", job.ID, ferr)
+			}
+		}
+	}()
 	lost := errors.New("job lease lost")
 	go func() {
 		t := time.NewTicker(w.opts.Lease / 3)
