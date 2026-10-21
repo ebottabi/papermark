@@ -16,12 +16,16 @@ export type UpdateBlock = {
   sections: UpdateSection[];
 };
 
+// A spawned sub-agent. `result` is null while it runs; its lane streams live.
+export type AgentLane = { agentId: string; title: string; result: { text: string; isError: boolean } | null };
+
 export type Block =
   | { kind: "assistant"; text: string }
   | { kind: "work"; tools: ToolItem[] }
   | { kind: "confirm"; name: string; input: unknown; allowAlways: boolean; decision: Decision | null }
   | { kind: "result"; text: string; files: string[] }
   | { kind: "update"; update: UpdateBlock }
+  | { kind: "lanes"; lanes: AgentLane[] }
   | { kind: "notice"; tone: "neutral" | "crit"; text: string };
 
 export type Turn = {
@@ -109,6 +113,7 @@ export function foldTimeline(events: AgentEvent[]): Timeline {
 
   const turns: Turn[] = [];
   const confirms: { name: string; block: Extract<Block, { kind: "confirm" }> }[] = [];
+  const lanes: AgentLane[] = []; // registry resolved by a later agent_done, like confirms
   let latestTodo: string | null = null;
 
   const startTurn = (user?: Turn["user"]): Turn => {
@@ -185,6 +190,24 @@ export function foldTimeline(events: AgentEvent[]): Timeline {
           },
         });
         break;
+      case "agent_started": {
+        const lane: AgentLane = { agentId: ev.agentId, title: str(ev.title) ?? ev.agentId, result: null };
+        lanes.push(lane);
+        // The parent spawns children back-to-back, so group them into one block.
+        const last = current.blocks[current.blocks.length - 1];
+        if (last && last.kind === "lanes") last.lanes.push(lane);
+        else addBlock({ kind: "lanes", lanes: [lane] });
+        break;
+      }
+      case "agent_done": {
+        for (let i = lanes.length - 1; i >= 0; i--) {
+          if (lanes[i].agentId === ev.agentId && lanes[i].result === null) {
+            lanes[i].result = { text: ev.text ?? "", isError: !!ev.isError };
+            break;
+          }
+        }
+        break;
+      }
       case "stopped":
         addBlock({ kind: "notice", tone: "neutral", text: str(ev.text) ?? "Task stopped." });
         break;

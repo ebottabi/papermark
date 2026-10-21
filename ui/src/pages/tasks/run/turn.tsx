@@ -7,6 +7,7 @@ import { WorkGroup } from "./work-group";
 import { ResultCard } from "./result-card";
 import { UpdateCard } from "./update-card";
 import { ApprovalCard } from "./approval-card";
+import { AgentLanes } from "./agent-lanes";
 
 type Confirm = Extract<Block, { kind: "confirm" }>;
 
@@ -81,6 +82,8 @@ const BlockView = ({
       return <ResultCard taskId={taskId} text={block.text} files={block.files} completed={completed} />;
     case "update":
       return <UpdateCard update={block.update} />;
+    case "lanes":
+      return <AgentLanes lanes={block.lanes} />;
     case "notice":
       return (
         <div

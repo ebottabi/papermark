@@ -42,6 +42,11 @@ export type AgentEvent =
   | { type: "idle"; text: string; files: string[] }
   | { type: "stopped"; text: string }
   | { type: "error"; text: string }
+  // Parallel sub-agents: the parent emits one `agent_started` per child when it
+  // spawns them, keeps running, then one `agent_done` per child once they finish.
+  // `agentId` is the sub-agent's own task id — stream it to render its live lane.
+  | { type: "agent_started"; agentId: string; title: string }
+  | { type: "agent_done"; agentId: string; text: string; isError: boolean }
   | {
       type: "update";
       id: string;
