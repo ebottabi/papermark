@@ -67,6 +67,9 @@ func (h *Harness) runTurn(ctx context.Context, task *models.Task) error {
 	if err := os.MkdirAll(workspace, 0o755); err != nil {
 		return err
 	}
+	if err := skills.Materialize(workspace); err != nil {
+		return err
+	}
 	// A sub-agent has no connectors: it cannot approve, so it is offered none.
 	subAgent := task.ParentID != nil
 	conn := &ConnectorToolset{}

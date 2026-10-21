@@ -95,7 +95,7 @@ func TestTraderScriptRuns(t *testing.T) {
 }
 
 func TestBuiltinSkillsLoad(t *testing.T) {
-	want := []string{"bills-and-renewals", "book-flight", "ctf", "daily-briefing", "expenses", "follow-ups", "inbox-triage", "meeting-follow-up", "meeting-prep", "research-report", "s3-pentest-commands", "schedule-meeting", "security-recon", "trader-alerts", "trader-analyst", "trader-broker", "trader-budget", "trader-copycat", "trader-news", "trader-pelosi", "trader-rebalance", "trader-risk", "trader-screener", "trader-tax", "travel-itinerary", "web-app-pentest", "weekly-review", "write-in-my-voice"}
+	want := []string{"bills-and-renewals", "book-flight", "ctf", "daily-briefing", "expenses", "follow-ups", "inbox-triage", "meeting-follow-up", "meeting-prep", "mr-robot", "research-report", "s3-pentest-commands", "schedule-meeting", "security-recon", "trader-alerts", "trader-analyst", "trader-broker", "trader-budget", "trader-copycat", "trader-news", "trader-pelosi", "trader-rebalance", "trader-risk", "trader-screener", "trader-tax", "travel-itinerary", "web-app-pentest", "weekly-review", "write-in-my-voice"}
 	got := Builtin()
 	if len(got) != len(want) {
 		t.Fatalf("got %d skills, want %d", len(got), len(want))
@@ -179,6 +179,70 @@ func TestPickReadsOneOrManyOrNone(t *testing.T) {
 	failing := func(context.Context, string, string, int) (string, error) { return "", errors.New("down") }
 	if got, ok := Pick(context.Background(), failing, "task", list); got != nil || ok {
 		t.Fatalf("a failed call picked %v, ok %v", got, ok)
+	}
+}
+
+func TestMRRobotLoadsVerbatim(t *testing.T) {
+	s, ok := Find("mr-robot")
+	if !ok {
+		t.Fatal("mr-robot missing from Builtin()")
+	}
+	if !validName.MatchString(s.Name) || s.Description == "" || s.Instructions == "" {
+		t.Fatalf("mr-robot: name/description/instructions not all valid and non-empty")
+	}
+	if !strings.HasPrefix(s.Description, "Offensive penetration-testing agent skill") {
+		t.Fatalf("mr-robot description = %q", s.Description)
+	}
+	raw, err := files.ReadFile("mr-robot/SKILL.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, body, ok := strings.Cut(string(raw), "\n---\n")
+	if !ok || strings.TrimSpace(body) != s.Instructions {
+		t.Fatal("mr-robot instructions differ from the embedded SKILL.md")
+	}
+}
+
+func TestMaterializeMRRobot(t *testing.T) {
+	dir := t.TempDir()
+	if err := Materialize(dir); err != nil {
+		t.Fatal(err)
+	}
+	paths := []string{
+		"skills/mr-robot/SKILL.md",
+		"skills/mr-robot/references/01-recon.md",
+		"skills/mr-robot/scripts/scan-all.sh",
+		"skills/mr-robot/scripts/score.mjs",
+		"skills/mr-robot/assets/wordlists/paths.txt",
+		"references/01-recon.md",
+		"assets/wordlists/paths.txt",
+		"scripts/scan-all.sh",
+	}
+	for _, p := range paths {
+		if _, err := os.Stat(filepath.Join(dir, filepath.FromSlash(p))); err != nil {
+			t.Errorf("%s missing: %v", p, err)
+		}
+	}
+	got, err := os.ReadFile(filepath.Join(dir, "skills/mr-robot/references/01-recon.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := files.ReadFile("mr-robot/references/01-recon.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(want) {
+		t.Fatal("materialized reference differs from the embedded one")
+	}
+	info, err := os.Stat(filepath.Join(dir, "skills/mr-robot/scripts/scan-all.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm()&0o111 == 0 {
+		t.Error("scan-all.sh is not executable")
+	}
+	if err := Materialize(dir); err != nil {
+		t.Fatalf("second Materialize: %v", err)
 	}
 }
 

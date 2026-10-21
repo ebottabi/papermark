@@ -35,6 +35,7 @@ type Skill struct {
 
 //go:embed *.md
 //go:embed trader
+//go:embed mr-robot
 var files embed.FS
 
 // validName is the rule user skills follow too (API.md).
@@ -80,8 +81,9 @@ func For(ctx context.Context, db queries.DBTX, userID uuid.UUID) ([]Skill, error
 }
 
 // mustLoad parses every <name>.md: a "---" block with a description line, then
-// the instructions. It also extracts the embedded trader/ scripts to disk and
-// resolves each skill's ${SKILLS_DIR} to its own extracted folder.
+// the instructions. A folder with a SKILL.md is a multi-file skill, named by
+// its frontmatter or folder. It also extracts the embedded trader/ scripts to
+// disk and resolves each skill's ${SKILLS_DIR} to its own extracted folder.
 func mustLoad() []Skill {
 	extractScripts()
 	entries, err := files.ReadDir(".")
@@ -90,7 +92,18 @@ func mustLoad() []Skill {
 	}
 	var out []Skill
 	for _, e := range entries {
-		if e.IsDir() { // the embedded trader/ tree, not a skill file
+		if e.IsDir() {
+			// trader/ is a tree of script-only skills, not a SKILL.md skill.
+			raw, err := files.ReadFile(path.Join(e.Name(), "SKILL.md"))
+			if err != nil {
+				continue
+			}
+			s, err := parse(e.Name(), string(raw))
+			if err != nil {
+				panic(fmt.Sprintf("skill %s: %v", e.Name(), err))
+			}
+			s.Instructions = strings.ReplaceAll(s.Instructions, "${SKILLS_DIR}", filepath.Join(skillsBase, s.Name))
+			out = append(out, s)
 			continue
 		}
 		raw, err := files.ReadFile(e.Name())
@@ -105,6 +118,48 @@ func mustLoad() []Skill {
 		out = append(out, s)
 	}
 	return out // ReadDir sorts by file name
+}
+
+// Materialize puts the multi-file mr-robot skill in a task's workspace. Its
+// files land under skills/mr-robot, exactly as upstream lays them out, and
+// references, assets and scripts are also linked at the workspace root because
+// the skill mixes both forms (skills/mr-robot/scripts/..., references/...).
+// Never overwrites a path the task already has.
+func Materialize(workspace string) error {
+	root := filepath.Join(workspace, "skills", "mr-robot")
+	if _, err := os.Stat(root); err != nil {
+		if !os.IsNotExist(err) {
+			return err
+		}
+		if err := os.MkdirAll(filepath.Dir(root), 0o755); err != nil {
+			return err
+		}
+		tree, err := fs.Sub(files, "mr-robot")
+		if err != nil {
+			return err
+		}
+		if err := os.CopyFS(root, tree); err != nil {
+			return err
+		}
+		for _, name := range []string{"scripts/backdoor-scan.sh", "scripts/race-probe.sh",
+			"scripts/scan-all.sh", "scripts/score.mjs", "scripts/setup-tools.sh"} {
+			if err := os.Chmod(filepath.Join(root, filepath.FromSlash(name)), 0o755); err != nil {
+				return err
+			}
+		}
+	}
+	for _, dir := range []string{"references", "assets", "scripts"} {
+		link := filepath.Join(workspace, dir)
+		if _, err := os.Lstat(link); err == nil {
+			continue
+		} else if !os.IsNotExist(err) {
+			return err
+		}
+		if err := os.Symlink(filepath.Join("skills", "mr-robot", dir), link); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // extractScripts writes the embedded trader/ tree under skillsBase, preserving
@@ -138,8 +193,23 @@ func parse(name, raw string) (Skill, error) {
 	if !ok || !strings.HasPrefix(raw, "---\n") {
 		return Skill{}, fmt.Errorf("missing --- header")
 	}
-	desc, ok := strings.CutPrefix(strings.TrimSpace(head), "description:")
-	if !ok || strings.TrimSpace(desc) == "" {
+	var desc string
+	for _, line := range strings.Split(head, "\n") {
+		key, value, ok := strings.Cut(strings.TrimSpace(line), ":")
+		if !ok {
+			continue
+		}
+		switch strings.TrimSpace(key) {
+		case "name":
+			name = strings.TrimSpace(value)
+			if !validName.MatchString(name) {
+				return Skill{}, fmt.Errorf("bad name %q", name)
+			}
+		case "description":
+			desc = strings.TrimSpace(value)
+		}
+	}
+	if desc == "" {
 		return Skill{}, fmt.Errorf("missing description")
 	}
 	body = strings.TrimSpace(body)
